@@ -137,13 +137,13 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
  * trail of the launch before is saved as prev-N.txt. */
 #define TRIALS 6
 #define BASE (R3D_SMALL|R3D_COLOR)      /* clip positions, client arrays, small draws, colour array */
-static const struct { const char *name;int mode,no_trees,no_light;float min_area2,inset; } trials[TRIALS]={
-    {"as before (clip positions, client arrays), finer trail",BASE,0,0,0.25f,0.9990234375f},
-    {"batches drawn last to first",BASE|R3D_REVERSE,0,0,0.25f,0.9990234375f},
-    {"no trees",BASE,1,0,0.25f,0.9990234375f},
-    {"no lightmap",BASE,0,1,0.25f,0.9990234375f},
-    {"tree batch one triangle per call",BASE|R3D_EACH,0,0,0.25f,0.9990234375f},
-    {"nothing under 2 square pixels, clip 1% inside",BASE,0,0,4.0f,0.99f},
+static const struct { const char *name;int mode,overscan;float min_area2,inset; } trials[TRIALS]={
+    {"clip 1% inside, usual area guard",BASE,0,0.25f,0.99f},
+    {"area guard of 2 square pixels, clip on the boundary (1/1024)",BASE,0,4.0f,0.9990234375f},
+    {"clip 0.4% inside",BASE,0,0.25f,0.996f},
+    {"clip 0.2% inside",BASE,0,0.25f,0.998f},
+    {"clip 1.5% inside, viewport 3x5 pixels larger than the panel",BASE,1,0.25f,0.985f},
+    {"clip 1% inside, large draws, no colour array",0,0,0.25f,0.99f},
 };
 static int trial;
 
@@ -171,7 +171,8 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
             char prev[16];snprintf(prev,sizeof prev,"prev-%d.txt",(trial+TRIALS-1)%TRIALS);
             save_previous_crumbs(prev);
             plat_write_file("trial.bin",&next,1);
-            scene_no_trees=trials[trial].no_trees;r3d_set_mode(trials[trial].mode);
+            scene_overscan_x=trials[trial].overscan?3:0;scene_overscan_y=trials[trial].overscan?5:0;
+            r3d_set_mode(trials[trial].mode);
             r3d_set_guard(trials[trial].min_area2,trials[trial].inset);
             plat_log("trial %d: %s",trial,trials[trial].name);
         }
@@ -225,7 +226,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         if(index>=PHASES){reported=1;index=0;}
         mode=phase_mode[index];
     }
-    if(trials[trial].no_light)mode=1;
+
     last=plat_time_us();now=last;        /* a log write above must not count as a frame */
     float dt=period?(float)period*1e-6f:1.f/30.f;
     if(dt>0.1f)dt=0.1f;

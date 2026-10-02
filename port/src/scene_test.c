@@ -52,6 +52,10 @@ int scene_init(void) {
     return sWall && sPlayerTex ? 0 : -1;
 }
 
+/* Test switch: draw into a viewport this many pixels larger than the panel on each side
+ * (the projection is narrowed to match), so that clipping a little inside the view volume
+ * still fills the screen. */
+int scene_overscan_x, scene_overscan_y;
 int scene_no_trees;       /* test switch: leave the trees out */
 int scene_indexed;       /* 1: the first test's path (GL transforms and clips indexed meshes), as a control */
 
@@ -98,7 +102,8 @@ void scene_frame(int w, int h, float dt, int mode) {
     if (sAnim >= 12000.f) sAnim -= 12000.f;
     float runner_z = -sDistance;
 
-    glViewport(0, 0, w, h);
+    int vw = w + 2 * scene_overscan_x, vh = h + 2 * scene_overscan_y;
+    glViewport(-scene_overscan_x, -scene_overscan_y, vw, vh);
     glClearColor(50 / 255.f, 82 / 255.f, 86 / 255.f, 1.f);
     glClearDepthf(1.f);
     glDepthMask(1);
@@ -109,7 +114,7 @@ void scene_frame(int w, int h, float dt, int mode) {
     glShadeModel(GL_SMOOTH);
 
     float near = 1.f, far = 400.f, top = near * 0.46630766f /* tan(25 deg) */, right = top * (float)w / (float)h;
-    float projection[16] = { near / right, 0, 0, 0, 0, near / top, 0, 0,
+    float projection[16] = { near / right * (float)w / (float)vw, 0, 0, 0, 0, near / top * (float)h / (float)vh, 0, 0,
                              0, 0, -(far + near) / (far - near), -1, 0, 0, -2.f * far * near / (far - near), 0 };
     /* camera 50 behind and 35 above the runner, looking 20 above them */
     float eye[3] = { 0, 35, runner_z + 50 };
@@ -131,7 +136,7 @@ void scene_frame(int w, int h, float dt, int mode) {
         glMatrixMode(GL_MODELVIEW);
         glLoadMatrixf(view);
     } else {
-        r3d_begin(w, h, projection, view);
+        r3d_begin(vw, vh, projection, view);
     }
 
     int first = (int)(sDistance / 60.f) - 1;
