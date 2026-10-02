@@ -131,20 +131,9 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
     if(manager)((event_fn)(0x084069d8u|1u))(manager,4);
 }
 
-/* Each launch tries the next way of handing the scene to GL, so a run of launches shows
- * which ones the nano's driver accepts. The trial number is stored before anything is
- * drawn; a trial that lives six seconds leaves its numbers in trial-N.txt, and the crash
- * trail of the launch before is saved as prev-N.txt. */
-#define TRIALS 6
-#define BASE (R3D_SMALL|R3D_COLOR)      /* clip positions, client arrays, small draws, colour array */
-static const struct { const char *name;int mode,overscan;float min_area2,inset; } trials[TRIALS]={
-    {"clip 1% inside, usual area guard",BASE,0,0.25f,0.99f},
-    {"area guard of 2 square pixels, clip on the boundary (1/1024)",BASE,0,4.0f,0.9990234375f},
-    {"clip 0.4% inside",BASE,0,0.25f,0.996f},
-    {"clip 0.2% inside",BASE,0,0.25f,0.998f},
-    {"clip 1.5% inside, viewport 3x5 pixels larger than the panel",BASE,1,0.25f,0.985f},
-    {"clip 1% inside, large draws, no colour array",0,0,0.25f,0.99f},
-};
+/* Soak test of the configuration the trials settled on (r3d.c defaults). */
+#define TRIALS 1
+static const struct { const char *name; } trials[TRIALS]={{"soak: clip positions, client arrays, 2 px area guard, lightmap"}};
 static int trial;
 
 /* Each mode runs for PHASE_US; a line is logged as each one ends (three writes in all),
@@ -152,7 +141,7 @@ static int trial;
 #define PHASE_US 3000000u
 #define PHASES 2
 /* the scene mode of each phase: with lightmap, without */
-static const uint8_t phase_mode[PHASES]={0,1};
+static const uint8_t phase_mode[PHASES]={0,0};
 static struct { uint32_t frames,max_period,work_max,over33;uint64_t period,work; } phase[PHASES];
 
 void tr_nano_frame(int w,int h,uint32_t frame) {
@@ -164,18 +153,8 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         uint64_t t0=plat_time_us();
         plat_log("Temple Run hardware test: panel %dx%d, heap free %u, largest %u, redraw %s",w,h,hb_os_heap_free(),
                  hb_os_heap_largest(),tr_fast_redraw?"2 ms heartbeat":"16 ms heartbeat");
-        {
-            uint32_t size=0;unsigned char *d=plat_read_file("trial.bin",&size,1);
-            trial=d&&size>=1?d[0]%TRIALS:0;free(d);
-            unsigned char next=(unsigned char)((trial+1)%TRIALS);
-            char prev[16];snprintf(prev,sizeof prev,"prev-%d.txt",(trial+TRIALS-1)%TRIALS);
-            save_previous_crumbs(prev);
-            plat_write_file("trial.bin",&next,1);
-            scene_overscan_x=trials[trial].overscan?3:0;scene_overscan_y=trials[trial].overscan?5:0;
-            r3d_set_mode(trials[trial].mode);
-            r3d_set_guard(trials[trial].min_area2,trials[trial].inset);
-            plat_log("trial %d: %s",trial,trials[trial].name);
-        }
+        save_previous_crumbs("prevboot.txt");
+        plat_log("%s",trials[0].name);
         port_crumb("trial",(uint32_t)trial,0);
         if(manifest() || scene_init()) {
             plat_log("initialization failed");port_log_flush(DATA_DIR "/log.txt");failed=1;return;
@@ -234,9 +213,10 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     {
         static int alive;
         uint32_t seconds=now>start?(uint32_t)((now-start)/1000000u):0;
-        if(reported && alive<2 && seconds>=(alive?90u:30u)) {
+        static const uint16_t marks[5]={30,90,180,300,600};
+        if(reported && alive<5 && seconds>=marks[alive]) {
             alive++;
-            plat_log("still running after %u s, %u frames",(unsigned)seconds,(unsigned)count);
+            plat_log("still running after %u s, %u frames, heap free %u",(unsigned)seconds,(unsigned)count,hb_os_heap_free());
             port_log_flush(DATA_DIR "/log.txt");
             last=0;
         }

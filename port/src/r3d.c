@@ -49,10 +49,14 @@ int r3d_stat_draws, r3d_stat_vertices_in, r3d_stat_triangles_in, r3d_stat_triang
     r3d_stat_clipped, r3d_stat_outside;
 static Batch sBatch[BATCHES];
 static OutVtx sPool[CHUNKS * CHUNK_VERTS];
-static int sMode = R3D_VBO;
+/* What the nano's driver was found to accept (see analysis/nano-gl-notes.md): clip-space
+ * positions in client arrays, with a colour array, in draws of at most 384 vertices. */
+static int sMode = R3D_SMALL | R3D_COLOR;
 static float sProjection[16], sView[16];
 void r3d_set_mode(int mode) { sMode = mode; }
-static float sMinArea2 = 0.25f, sInset = 0.9990234375f;
+/* With two texture units the driver reboots on small triangles: an area guard of 1/8 pixel
+ * crashed in the first frame every time, 2 square pixels ran. (Twice the area is compared.) */
+static float sMinArea2 = 4.0f, sInset = 0.9990234375f;
 void r3d_set_guard(float min_area2, float inset) { sMinArea2 = min_area2; sInset = inset; }
 static int sChunksUsed;
 static GLuint sVbo;

@@ -82,6 +82,7 @@ int main(int argc, char **argv) {
     int frames = argc > 4 ? atoi(argv[4]) : 90;
     if (argc > 5) { int m = atoi(argv[5]); if (m < 0) scene_indexed = 1; else r3d_set_mode(m); }
     if (argc > 6) { scene_overscan_x = 3; scene_overscan_y = 5; r3d_set_guard(0.25f, (float)atof(argv[6])); }
+    if (getenv("TR_AREA2")) { scene_overscan_x = scene_overscan_y = 0; r3d_set_guard((float)atof(getenv("TR_AREA2")), 0.9990234375f); }
     long tiny = 0, clipped = 0, out = 0;
     for (int i = 0; i < frames; i++) {
         /* uneven steps, so the camera lands on many different positions */
