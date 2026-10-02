@@ -304,12 +304,7 @@ void game_frame(float dt) {
     CRUMB("clear");
     fe_frame_begin(sW, sH);
     if (!sDrawing) return;
-    if (!sSceneReady) {
-        /* A loading screen: a few pixels of a wall texture, then the logo. The platform says
-         * when the scene may be drawn (see nano_platform.c: drawing it too soon after the
-         * textures go up rebooted the iPod). */
-        if (sTest[0]) fe_overlay(sTest[0], 2.0f, 2.0f, 6.0f, 6.0f, 0.4f, 0.4f, 0.6f, 0.6f, WHITE);
-        if (++sWarm > 12) picture("logo", 0.0f, 12.0f * (float)sW / 320.0f, (float)sW, WHITE);
+    if (!sSceneReady) {             /* nothing but the cleared screen until the platform says so */
         CRUMB("wait");
         fe_frame_end();
         return;

@@ -142,6 +142,7 @@ int main(int argc, char **argv) {
         if (getenv("TR_TAP") && f >= atoi(getenv("TR_TAP")) - 1 && f <= atoi(getenv("TR_TAP")) + 4)
             fprintf(stderr, "frame %d: state %d, %d triangles out, %d draws, score %d\n", f, game_state(), fe_stat_triangles_out, fe_stat_draws, game_score());
         glFinish();
+        { extern int fe_stat_near; if (getenv("TR_NEAR") && (f < 12 || f % 20 == 0)) fprintf(stderr, "frame %d: %d triangles crossed the near plane, %d clipped, %d out\n", f, fe_stat_near, fe_stat_clipped, fe_stat_triangles_out); }
         if (game_state() == GAME_OVER && last_state == GAME_RUNNING) {
             runs++;
             if (game_distance() > best) best = game_distance();

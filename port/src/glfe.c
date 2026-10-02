@@ -235,6 +235,7 @@ static OutVtx sPool[CHUNKS * CHUNK_VERTS];
 static Batch sBatches[BATCHES];
 static int sBatchCount, sChunksUsed, sOrderedOpen = -1;
 static float sHalfW = 120.0f, sHalfH = 216.0f;
+int fe_stat_near;           /* triangles this frame that crossed the near plane */
 int fe_stat_slivers;        /* host builds: triangles given to GL that fail the guard (must stay 0) */
 int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_triangles_out, fe_stat_tiny, fe_stat_clipped,
     fe_stat_dropped, fe_stat_calls, fe_stat_fogged, fe_stat_outside;
@@ -510,6 +511,7 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
             Vtx *t = in; in = out; out = t;
         }
         fe_stat_clipped++;
+        if (any & 16) fe_stat_near++;
         if (k < 3) continue;
         float sx[10], sy[10];
         for (int j = 0; j < k; j++) {
@@ -593,6 +595,7 @@ void fe_frame_begin(int panel_w, int panel_h) {
     fe_stat_draws = fe_stat_vertices_in = fe_stat_triangles_in = fe_stat_triangles_out = fe_stat_tiny = 0;
     fe_stat_clipped = fe_stat_dropped = fe_stat_calls = fe_stat_fogged = 0;
     fe_time_transform_us = fe_time_submit_us = 0;
+    fe_stat_near = 0;
     uint64_t t0 = plat_time_us();
     glViewport(0, 0, panel_w, panel_h);
     glClearColor(sClear[0], sClear[1], sClear[2], sClear[3]);

@@ -357,11 +357,12 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         /* After loading, the OS heap keeps growing for a second or two (about 0.6 MB: the
          * driver letting go of the texture uploads, it seems), and a full scene drawn during
          * that time rebooted the iPod on most launches, while scenes first drawn two or three
-         * seconds in never have. So the scene waits until the heap has stopped growing. */
+         * seconds in never have. So nothing at all is drawn for the first four seconds, and
+         * then not until the heap has stopped growing. */
         static uint32_t highest,steady,ready_at;
         uint32_t free_now=hb_os_heap_free();
         if(free_now>highest+8192u){highest=free_now;steady=0;}else steady++;
-        if(!ready_at && ((count>=75 && steady>=30) || count>=300)) {
+        if(!ready_at && ((count>=120 && steady>=45) || count>=400)) {
             ready_at=count;port_crumb("ready-at",count,free_now);
         }
         game_set_scene_ready(ready_at!=0);
