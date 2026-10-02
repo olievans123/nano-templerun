@@ -81,8 +81,9 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
     if(manager)((event_fn)(0x084069d8u|1u))(manager,4);
 }
 
-/* Each mode runs for PHASE_US, then one report is written and the full scene carries on. */
-#define PHASE_US 6000000u
+/* Each mode runs for PHASE_US; a line is logged as each one ends (three writes in all),
+ * then the full scene carries on. */
+#define PHASE_US 3000000u
 static struct { uint32_t frames,max_period,work_max,over33;uint64_t period,work; } phase[3];
 
 void tr_nano_frame(int w,int h,uint32_t frame) {
@@ -106,26 +107,26 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     keep_awake();
     uint64_t now=plat_time_us();
     if(!start)start=now+500000u;                    /* let the first frames settle */
-    uint32_t period=last?(uint32_t)(now-last):0;last=now;
+    uint32_t period=last?(uint32_t)(now-last):0;
     int mode=0;
+    static int logged;
     if(!reported && now>=start) {
         uint32_t elapsed=(uint32_t)(now-start);
         mode=(int)(elapsed/PHASE_US);
-        if(mode>2) {
-            reported=1;mode=0;
-            static const char *names[3]={"track+lightmap+characters","no lightmap","track only, no lightmap"};
-            for(int i=0;i<3;i++) {
-                uint32_t n=phase[i].frames?phase[i].frames:1;
-                uint32_t fps10=phase[i].period?(uint32_t)((uint64_t)phase[i].frames*10000000u/phase[i].period):0;
-                plat_log("%s: frames=%u fps=%u.%u work_us=%u work_max=%u period_max=%u over_33ms=%u",names[i],
-                         phase[i].frames,fps10/10,fps10%10,(unsigned)(phase[i].work/n),phase[i].work_max,
-                         phase[i].max_period,phase[i].over33);
-            }
-            plat_log("per frame: %d draws, %d vertices, %d triangles",scene_stat_draws,scene_stat_vertices,scene_stat_triangles);
+        static const char *names[3]={"track+lightmap+characters","no lightmap","track only, no lightmap"};
+        while(logged<mode && logged<3) {
+            int i=logged++;
+            uint32_t n=phase[i].frames?phase[i].frames:1;
+            uint32_t fps10=phase[i].period?(uint32_t)((uint64_t)phase[i].frames*10000000u/phase[i].period):0;
+            plat_log("%s: frames=%u fps=%u.%u work_us=%u work_max=%u period_max=%u over_33ms=%u; %d draws, %d vertices",
+                     names[i],phase[i].frames,fps10/10,fps10%10,(unsigned)(phase[i].work/n),phase[i].work_max,
+                     phase[i].max_period,phase[i].over33,scene_stat_draws,scene_stat_vertices);
             port_log_flush(DATA_DIR "/log.txt");
             last=0;
         }
+        if(mode>2){reported=1;mode=0;}
     }
+    last=plat_time_us();now=last;        /* a log write above must not count as a frame */
     float dt=period?(float)period*1e-6f:1.f/30.f;
     if(dt>0.1f)dt=0.1f;
     scene_frame(w,h,dt,mode);
