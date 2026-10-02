@@ -25,10 +25,13 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / 'original/v1.0/Payload/TempleRun.app'
 PVR = ['terrainTexture', 'playerTexture', 'playerGlowTexture', 'enemyTexture', 'wallTexture', 'treeTexture', 'lightMapTexture']
 # name the engine loads -> (largest side on the iPod)
-# The sheets keep their size and get no smaller levels, as on the phone: their sprites sit a
-# pixel or two apart, and any shrinking lets neighbours show at a sprite's edge. (The tutorial
-# sheet is not used: the tutorial is off.)
-PNG = {'interfaceTexture': 1024, 'effectsTexture': 1024, 'tutorialTexture': 64, 'fontNumbers': 256, 'fontCountdown': 256}
+# The sheets are halved to 512 and get no smaller levels. Three 1024-pixel sheets were more
+# than the iPod's driver would take: it rebooted the first time the third one was drawn with,
+# whichever that was, and no other texture is sent with a level above 512 (the loader leaves
+# out the largest level of the 1024-pixel scenery). On a 240-pixel panel a 512 sheet is still
+# shown smaller than it is. (The tutorial sheet is not used: the tutorial is off.)
+SHEET = 512
+PNG = {'interfaceTexture': SHEET, 'effectsTexture': SHEET, 'tutorialTexture': 64, 'fontNumbers': 256, 'fontCountdown': 256}
 
 out = Path(sys.argv[1])
 host, nano = out / 'host', out / 'nano'
@@ -52,7 +55,7 @@ for name in PVR:
 for name, side in PNG.items():
     im = read_png(APP / (name + '.png'))
     if max(im.size) > side:
-        im = im.resize((side, side), Image.LANCZOS)
+        im = im.resize((side, side), Image.BOX)     # plain averaging: nothing spreads past a pixel
     pvr = pvrtc.encode_pvr(im, mipmaps=False)
     (nano / (name + '.pvr')).write_bytes(pvr)
     w, h = im.size
@@ -105,19 +108,18 @@ def build_ui_sheet():
     return sheet, places
 
 
-sheet, places = build_ui_sheet()
+sheet, places = build_ui_sheet()            # laid out at 1024 (ui.txt is in those units), sent at half that
+sheet = sheet.resize((SHEET, SHEET), Image.BOX)
 pvr = pvrtc.encode_pvr(sheet, mipmaps=False)
 (nano / 'uiSheet.pvr').write_bytes(pvr)
 (nano / 'ui.txt').write_text('\n'.join(places) + '\n')
-decoded = Image.frombytes('RGBA', (1024, 1024), texture2ddecoder.decode_pvrtc(pvr[52:], 1024, 1024, 0), 'raw', 'BGRA')
-(host / 'uiSheet.rgba').write_bytes(struct.pack('<II', 1024, 1024) + decoded.tobytes())
+decoded = Image.frombytes('RGBA', (SHEET, SHEET), texture2ddecoder.decode_pvrtc(pvr[52:], SHEET, SHEET, 0), 'raw', 'BGRA')
+(host / 'uiSheet.rgba').write_bytes(struct.pack('<II', SHEET, SHEET) + decoded.tobytes())
 
-# Two test textures for finding what the nano's driver accepts: sheets with their smaller
-# levels (the game's own sheets have one level).
-for name, source in (('testMip256', 'fontNumbers'), ('testMip1024', 'interfaceTexture')):
-    pvr = pvrtc.encode_pvr(read_png(APP / (source + '.png')), mipmaps=True)
-    (nano / (name + '.pvr')).write_bytes(pvr)
-    (host / (name + '.rgba')).write_bytes((host / (source + '.rgba')).read_bytes())
+for stale in ('testMip256', 'testMip1024'):     # test textures of earlier builds
+    for f in (nano / (stale + '.pvr'), host / (stale + '.rgba')):
+        if f.exists():
+            f.unlink()
 
 for pattern in ('*.bksb', '*.atlas', '*.fnt', 'modelRegistry.lvl'):
     for f in sorted(APP.glob(pattern)):

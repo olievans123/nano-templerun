@@ -41,3 +41,17 @@ which fits the earlier finding that the driver transforms on the CPU anyway.
   file after a log you want to keep.
 - **The resident's touch mailbox goes stale when frames are long** (about 45 ms here); the OS
   touch list at 0x089a5298 can be read directly as well.
+
+## 2 October, later: three 1024-pixel sheets (not yet confirmed fixed)
+
+- With every texture given a first draw of its own (a 40-pixel square, one new texture every
+  twelve frames), both launches rebooted on the first draw with the **third** single-level
+  1024x1024 PVRTC sheet (uiSheet and the interface sheet had drawn; the effects sheet did
+  not). Earlier builds drew the title for minutes with two of them (uiSheet, effects) and
+  rebooted on the frame that first used the third (interface, when a run starts). Which
+  sheet is third does not matter.
+- The scenery's 1024-pixel textures never send their largest level, so these three sheets
+  were the only levels above 512 on the device. They are now sent at 512x512 (131 KB each
+  instead of 524 KB).
+- Builds that first drew two of the sheets in the same frame rebooted on that frame (seven
+  launches of seven); the start-up squares stay until that is understood.

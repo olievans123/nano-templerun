@@ -26,7 +26,7 @@ extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail 
 #endif
 
 unsigned fe_time_draw_us;       /* the last frame's time in the engine's draw(), including the port's transform */
-#define TESTS 15
+#define TESTS 13
 #define TEST_SPACING 12
 static unsigned sTest[TESTS];
 #ifdef AB_NANO
@@ -212,14 +212,11 @@ static void load_screens(void) {
     }
     free(text);
     sUiTexture = rt_host_load_texture("uiSheet", "uiSheet.png", 0);
-    sTest[0] = rt_texture_host(10);     /* wallTexture: the kind the test scene proved */
-    sTest[3] = rt_texture_host(5);      /* fontCountdownTexture */
-    sTest[4] = sUiTexture;
-    sTest[1] = rt_host_load_texture("testMip256", "testMip256.png", 0);
-    sTest[2] = rt_host_load_texture("testMip1024", "testMip1024.png", 0);
-    {   /* then the engine's own, sheets first: interface, effects, digits, terrain, runner, glow, monkeys, trees, light map, tutorial */
-        static const uint8_t rest[10] = { 1, 3, 4, 6, 7, 8, 9, 11, 12, 2 };
-        for (int i = 0; i < 10; i++) sTest[5 + i] = rt_texture_host(rest[i]);
+    {   /* every texture the game draws with, the three sheets last: wall, countdown, digits, terrain,
+         * runner, glow, monkeys, trees, light map, tutorial, then the effects and interface sheets */
+        static const uint8_t order[12] = { 10, 5, 4, 6, 7, 8, 9, 11, 12, 2, 3, 1 };
+        for (int i = 0; i < 12; i++) sTest[i] = rt_texture_host(order[i]);
+        sTest[12] = sUiTexture;
     }
 }
 
