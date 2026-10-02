@@ -252,6 +252,13 @@ unsigned fe_time_engine_us;
  * plain (0); the smallest single-texture triangle kept, as twice its area in pixels. */
 int fe_option_fog_blend = 1;
 float fe_option_min_area2 = 4.0f;
+/* The most triangles a frame may give the driver. It needs memory for every triangle of a
+ * frame and the iPod reboots when it has none: the benchmark app found about 3,200 a frame
+ * with twice the memory free that this game leaves, and here a frame of 1,507 was drawn and
+ * the next, of about 1,550, rebooted it. One frame in seven of the game is over 1,500,
+ * and the most seen is 2,300. */
+int fe_option_budget = 1300;
+int fe_stat_trimmed, fe_stat_cut;       /* this frame: triangles left out for the budget, and the level (see showing) of the last of them */
 unsigned fe_time_clear_us, fe_time_first_draw_us;       /* this frame: the clear; the first draw call given to GL */
 unsigned fe_time_transform_us, fe_time_submit_us;      /* this frame: in draw calls here; handing the frame to GL */
 int fe_peak_vertices, fe_peak_chunks, fe_peak_batches;   /* the most one draw call, one frame have needed */
@@ -658,6 +665,78 @@ static void draw_batch(const Batch *b, int index) {
     }
 }
 
+static int batch_vertices(const Batch *b) { return b->chunks ? (b->chunks - 1) * CHUNK_VERTS + b->last : 0; }
+static inline OutVtx *batch_vertex(const Batch *b, int i) { return &sPool[b->chunk[i / CHUNK_VERTS] * CHUNK_VERTS + i % CHUNK_VERTS]; }
+static void batch_resize(Batch *b, int vertices) {
+    b->chunks = (uint8_t)((vertices + CHUNK_VERTS - 1) / CHUNK_VERTS);
+    b->last = vertices ? vertices - (b->chunks - 1) * CHUNK_VERTS : CHUNK_VERTS;
+}
+/* How much of a fogged triangle is seen: its area in pixels times how far it shows through
+ * the fog (its colours already carry that), as a level on a scale of eight steps per doubling
+ * (1 to 65,000 square pixels fully clear). */
+#define LEVELS 128
+static inline unsigned showing(const OutVtx *v) {
+    float ia = 1.f / v[0].w, ib = 1.f / v[1].w, ic = 1.f / v[2].w;
+    float ax = v[0].x * ia, ay = v[0].y * ia;
+    float area2 = ((v[1].x * ib - ax) * (v[2].y * ic - ay) - (v[2].x * ic - ax) * (v[1].y * ib - ay)) * sHalfW * sHalfH;
+    unsigned a = v[0].color >> 24, b = v[1].color >> 24, c = v[2].color >> 24;
+    union { float f; uint32_t u; } score;
+    score.f = (area2 < 0.f ? -area2 : area2) * (float)(a + b + c + 3u);
+    uint32_t level = (score.u >> 20) & 0x7ffu;          /* exponent and three bits: 8 per doubling */
+    return level <= 1016u ? 0u : level >= 1016u + LEVELS ? LEVELS - 1u : level - 1016u;
+}
+/* Keep the frame within the budget. The fogged scenery gives way first, and of it the
+ * triangles that show least: small and far into the fog. If that is not enough (it never
+ * has been: the unfogged scenery and everything else come to a few hundred) the unfogged
+ * scenery is cut short. */
+static void trim(void) {
+    int total = 0;
+    fe_stat_trimmed = fe_stat_cut = 0;
+    for (int i = 0; i < sBatchCount; i++) total += batch_vertices(&sBatches[i]) / 3;
+    int excess = total - fe_option_budget;
+    if (excess <= 0) return;
+    static uint16_t count[LEVELS];
+    static uint8_t level[CHUNKS * CHUNK_VERTS / 3];
+    for (int i = 0; i < LEVELS; i++) count[i] = 0;
+    int t = 0;
+    for (int i = 0; i < sBatchCount; i++) {
+        const Batch *b = &sBatches[i];
+        if (b->kind != FOGGED) continue;
+        /* the scenery has a light map; what has none is the monkeys and the water, which stay
+         * unless the scenery alone cannot make the room */
+        const unsigned keep = b->tex1 ? 0u : LEVELS / 2u;
+        for (int j = 0, n = batch_vertices(b); j < n; j += 3) {
+            unsigned l = showing(batch_vertex(b, j)) / 2u + keep;
+            count[level[t++] = (uint8_t)l]++;
+        }
+    }
+    int cut = 0, going = 0;
+    while (cut < LEVELS - 1 && going + count[cut] < excess) going += count[cut++];
+    int partial = excess - going;                       /* this many of the last level go too */
+    fe_stat_cut = cut;
+    t = 0;
+    for (int i = 0; i < sBatchCount; i++) {
+        Batch *b = &sBatches[i];
+        if (b->kind != FOGGED) continue;
+        int kept = 0;
+        for (int j = 0, n = batch_vertices(b); j < n; j += 3) {
+            int l = level[t++];
+            if (l < cut || (l == cut && partial > 0 && partial--)) { fe_stat_trimmed++; continue; }
+            if (kept != j) { const OutVtx *v = batch_vertex(b, j); OutVtx *o = batch_vertex(b, kept); o[0] = v[0]; o[1] = v[1]; o[2] = v[2]; }
+            kept += 3;
+        }
+        batch_resize(b, kept);
+    }
+    excess -= fe_stat_trimmed;
+    for (int i = sBatchCount - 1; i >= 0 && excess > 0; i--) {
+        Batch *b = &sBatches[i];
+        if (b->kind != OPAQUE) continue;
+        int n = batch_vertices(b) / 3, drop = n < excess ? n : excess;
+        batch_resize(b, (n - drop) * 3);
+        excess -= drop; fe_stat_trimmed += drop;
+    }
+}
+
 static void submit(void);
 void fe_frame_end(void) {
     uint64_t t0 = plat_time_us();
@@ -666,6 +745,7 @@ void fe_frame_end(void) {
 }
 static void submit(void) {
     if (!sChunksUsed) return;
+    trim();
 #ifndef AB_NANO
     if (getenv("TR_DUMP_BATCHES"))
         for (int i = 0; i < sBatchCount; i++) {

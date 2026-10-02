@@ -42,7 +42,7 @@ which fits the earlier finding that the driver transforms on the CPU anyway.
 - **The resident's touch mailbox goes stale when frames are long** (about 45 ms here); the OS
   touch list at 0x089a5298 can be read directly as well.
 
-## 2 October, later: three 1024-pixel sheets (not yet confirmed fixed)
+## 2 October, later: three 1024-pixel sheets (fixed: sent at 512)
 
 - With every texture given a first draw of its own (a 40-pixel square, one new texture every
   twelve frames), both launches rebooted on the first draw with the **third** single-level
@@ -55,3 +55,18 @@ which fits the earlier finding that the driver transforms on the CPU anyway.
   instead of 524 KB).
 - Builds that first drew two of the sheets in the same frame rebooted on that frame (seven
   launches of seven); the start-up squares stay until that is understood.
+- Confirmed on the sixteenth run: with the sheets at 512 the squares, the title and the start
+  of a run all drew.
+
+## 2 October: a triangle limit per frame (budget not yet confirmed)
+
+- The first run played about 50 frames and the iPod rebooted in a frame of about 1,550
+  triangles (1,558 with the digits it had not reached); the frame before held 1,507 and the
+  title frames 1,200 to 1,300. OS heap free 3.87 MB, largest block reported 2 MB.
+- This is the limit the benchmark app found on 29 September: about 3,200 triangles a frame
+  with a 3 MB app loaded beside it, no limit reached after a fresh boot. The driver needs
+  memory per triangle of a frame and reboots when it cannot get it; the limit follows the
+  free memory (here half of what the benchmark had, and half the triangles).
+- The game is over 1,500 triangles in one frame of seven, 2,300 at most. `glfe.c` now trims
+  each frame to `fe_option_budget` (1,300): fogged scenery first, least-seen first (area
+  times how far it shows through the fog), the monkeys and water after the scenery.

@@ -105,6 +105,9 @@ static void screenshot(const char *path) {
     fclose(f); free(px); free(raw); free(z);
 }
 
+static int sHist[40], sHistMax, sHistMaxFrame, capped_frames, cut_hist[9], cut_max;
+static long capped, detail_sum;
+static int sFound = -1000, sFinds;
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: game_host <iPod data dir> <host texture dir> <out dir> <frames> [seed] [shot every n]\n"); return 2; }
     sDirs[0] = argv[1]; sDirs[1] = argv[2];
@@ -133,6 +136,7 @@ int main(int argc, char **argv) {
     game_autopilot(getenv("TR_NOAUTO") ? 0 : 1);
 
     uint64_t t0 = plat_time_us();
+    if (getenv("TR_CAP")) fe_option_budget = atoi(getenv("TR_CAP"));
     for (int f = 0; f < frames; f++) {
 
         if (getenv("TR_TAP") && f == atoi(getenv("TR_TAP"))) { setenv("TR_GLLOG", "1", 1); setenv("TR_TEXLOG", "1", 1); fprintf(stderr, "--- tap\n"); game_touch(0, 120, 300); }
@@ -149,8 +153,16 @@ int main(int argc, char **argv) {
             if (getenv("TR_RUNS")) fprintf(stderr, "run %d ended at frame %d: distance %d, score %d, coins %d\n", runs, f, game_distance(), game_score(), game_coins());
         }
         last_state = game_state();
+        capped += fe_stat_trimmed; if (fe_stat_trimmed) capped_frames++; if (fe_stat_cut > cut_max) cut_max = fe_stat_cut; cut_hist[fe_stat_trimmed ? 1 + fe_stat_cut / 16 : 0]++;
+        { int bin = fe_stat_triangles_out / 100; if (bin > 39) bin = 39; sHist[bin]++; if (fe_stat_triangles_out > sHistMax) { sHistMax = fe_stat_triangles_out; sHistMaxFrame = f; } }
         tris += fe_stat_triangles_out; tiny += fe_stat_tiny; clipped += fe_stat_clipped; dropped += fe_stat_dropped;
         fogged += fe_stat_fogged; draws += fe_stat_draws;
+        if (getenv("TR_SHOT_AT")) {         /* a list of frames, e.g. 617,1134 */
+            char list[256]; snprintf(list, sizeof list, ",%s,", getenv("TR_SHOT_AT"));
+            char key[24]; snprintf(key, sizeof key, ",%d,", f);
+            if (strstr(list, key)) { char path[1024]; snprintf(path, sizeof path, "%s/at%05d.png", argv[3], f); screenshot(path); fprintf(stderr, "frame %d: %d triangles, %d left out, cut %d\n", f, fe_stat_triangles_out, fe_stat_trimmed, fe_stat_cut); }
+        }
+        if (getenv("TR_FIND") && game_state() == GAME_RUNNING && fe_stat_trimmed > 350 && f > sFound + 300 && sFinds < 6) { sFound = f; sFinds++; fprintf(stderr, "find %d cut %d trimmed %d\n", f, fe_stat_cut, fe_stat_trimmed); }
         if ((every && f % every == every - 1) || (getenv("TR_SHOT_STATES") && (f == 30 || (game_state() == GAME_OVER && last_over != runs && (last_over = runs))))) {
             char path[1024];
             snprintf(path, sizeof path, "%s/game%04d.png", argv[3], f + 1);
@@ -165,6 +177,14 @@ int main(int argc, char **argv) {
     { extern float fe_ext_min_w, fe_ext_max_w, fe_ext_min_depth, fe_ext_max_depth, fe_ext_max_uv; extern int fe_stat_near;
       fprintf(stderr, "extremes: w %.3f..%.1f, depth %.5f..%.5f, |uv| up to %.2f; near crossings in the last frame %d\n", (double)fe_ext_min_w,
               (double)fe_ext_max_w, (double)fe_ext_min_depth, (double)fe_ext_max_depth, (double)fe_ext_max_uv, fe_stat_near); }
+    if (getenv("TR_HIST")) {
+        fprintf(stderr, "budget %d: %ld triangles left out in %d frames; highest cut level %d of 127; frames by cut (none, then 16 wide):", fe_option_budget, capped, capped_frames, cut_max);
+        for (int i = 0; i < 9; i++) fprintf(stderr, " %d", cut_hist[i]);
+        fprintf(stderr, "\ntriangles per frame: most %d (frame %d);", sHistMax, sHistMaxFrame);
+        int over[5] = { 1200, 1300, 1400, 1500, 2000 };
+        for (int k = 0; k < 5; k++) { int n = 0; for (int i = over[k] / 100; i < 40; i++) n += sHist[i]; fprintf(stderr, " over %d: %d;", over[k], n); }
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr, "peaks: %d vertices in one draw, %d chunks of 384 vertices and %d batches in one frame\n", fe_peak_vertices,
             fe_peak_chunks, fe_peak_batches);
     return 0;

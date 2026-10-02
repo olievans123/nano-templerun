@@ -349,11 +349,8 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     float tilt=(float)-g[0]*0.001f;                     /* the phone reports gravity; the nano the opposite */
     game_tilt(tilt>1.f?1.f:tilt<-1.f?-1.f:tilt);
 
-    /* Ease in: once, the very first frame drawn after loading rebooted the iPod, while the
-     * same frame a few seconds later never has. So the first frames after the textures go
-     * up only clear the screen, and the next ones draw without the fog blending. */
+    /* The first frames after the textures go up only clear the screen. */
     game_set_drawing(count>=4);
-    fe_option_fog_blend=count>=210;
     port_crumb("heap",hb_os_heap_free(),hb_os_heap_largest());
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();
@@ -367,6 +364,9 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     if(period>perf.max_period)perf.max_period=period;
     if(work>perf.max_work)perf.max_work=work;
     perf.over40+=period>40000u;
+    static uint32_t most_triangles,trimmed_frames,trimmed;
+    if((uint32_t)fe_stat_triangles_out>most_triangles)most_triangles=(uint32_t)fe_stat_triangles_out;
+    if(fe_stat_trimmed){trimmed_frames++;trimmed+=(uint32_t)fe_stat_trimmed;}
     (void)t1;
 
     if(tr_fast_redraw && work+gap_estimate<BEAT_US) {    /* hold the 30 Hz beat (a spin: the UI task has no sleep) */
@@ -386,11 +386,11 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
                  (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),
                  (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),
                  (unsigned)(perf.first/perf.frames),perf.max_work,perf.max_period,perf.over40);
-        plat_log("  per frame %u vertices in, %u triangles out, %u draws; dropped %u; state %d, distance %d, presses %u (mailbox %u, list %u); heap free %u, engine heap %u",
-                 perf.vertices/perf.frames,perf.triangles/perf.frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
+        plat_log("  per frame %u vertices in, %u triangles out (most %u; %u left out in %u frames), %u draws; dropped %u; state %d, distance %d, presses %u (mailbox %u, list %u); heap free %u, engine heap %u",
+                 perf.vertices/perf.frames,perf.triangles/perf.frames,(unsigned)most_triangles,(unsigned)trimmed,(unsigned)trimmed_frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
                  (unsigned)touch_presses,(unsigned)touch_from_mailbox,(unsigned)touch_from_list,hb_os_heap_free(),(unsigned)rt_heap_peak());
         flush_log();
-        memset(&perf,0,sizeof perf);
+        memset(&perf,0,sizeof perf);most_triangles=trimmed=trimmed_frames=0;
         last=0;
     }
     previous_end=plat_time_us();
