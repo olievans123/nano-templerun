@@ -119,9 +119,6 @@ void game_tilt(float x) { sTilt = x; }
 static int sDrawing = 1, sWarm;
 unsigned rt_texture_host(uint32_t id);
 void game_set_drawing(int on) { sDrawing = on; }
-static int sSceneReady = 1;
-void game_set_scene_ready(int ready) { sSceneReady = ready; }
-static float picture(const char *name, float x, float y, float width, uint32_t colour);
 
 /* ---- autopilot: plays through the same touch calls a finger makes ---------------------------- */
 #define PLAYER_OFFSET 0x198
@@ -216,7 +213,10 @@ static void load_screens(void) {
     free(text);
     sUiTexture = rt_host_load_texture("uiSheet", "uiSheet.png", 0);
     sTest[0] = rt_texture_host(10);     /* wallTexture: the kind the test scene proved */
-
+    sTest[3] = rt_texture_host(5);      /* fontCountdownTexture */
+    sTest[4] = sUiTexture;
+    sTest[1] = rt_host_load_texture("testMip256", "testMip256.png", 0);
+    sTest[2] = rt_host_load_texture("testMip1024", "testMip1024.png", 0);
 }
 
 static const Sprite *sprite(const char *name) {
@@ -304,8 +304,16 @@ void game_frame(float dt) {
     CRUMB("clear");
     fe_frame_begin(sW, sH);
     if (!sDrawing) return;
-    if (!sSceneReady) {             /* nothing but the cleared screen until the platform says so */
-        CRUMB("wait");
+    if (sWarm < TESTS * TEST_SPACING) {
+        /* Hardware test at start-up: the iPod rebooted about 25 ms after the first rectangle
+         * drawn with one of the sprite sheets. One texture of each kind is shown in turn, a
+         * dozen frames apart, so the trail says which kind the driver cannot take. */
+        static const char *const kind[TESTS] = { "wall RGB levels", "256 RGBA levels", "1024 RGBA levels", "256 RGBA single", "1024 RGBA single" };
+        int test = sWarm / TEST_SPACING;
+        if (sWarm % TEST_SPACING == 0) { plat_log("test %d: %s", test, kind[test]); plat_log_flush(); port_test_mark(test); }
+        for (int t = 0; t <= test; t++)
+            if (sTest[t]) fe_overlay(sTest[t], 8.0f + 44.0f * (float)t, 8.0f, 40.0f, 40.0f, 0.3f, 0.3f, 0.7f, 0.7f, WHITE);
+        sWarm++;
         fe_frame_end();
         return;
     }
