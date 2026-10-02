@@ -68,7 +68,55 @@ int plat_write_file(const char *name,const void *data,uint32_t size) {
 void plat_log(const char *format,...) {
     va_list args;va_start(args,format);vprintf(format,args);va_end(args);putchar('\n');
 }
-void port_crumb(const char *tag,uint32_t a,uint32_t b){(void)tag;(void)a;(void)b;}
+/* Breadcrumbs, as in the Angry Birds port: a small RAM ring tagged with a magic. RAM
+ * survives a panic reboot, so the next launch finds the previous run's ring and saves it
+ * as prevboot.txt. Never written to disk while running. */
+#define CRUMB_MAGIC0 0x54525542u
+#define CRUMB_MAGIC1 0x43524d42u
+typedef struct { uint32_t magic0,magic1,len,seq;char text[8176]; } crumb_ring_t;
+static crumb_ring_t *s_ring;
+void port_crumb(const char *tag,uint32_t a,uint32_t b) {
+    static const char hex[]="0123456789abcdef";
+    static uint32_t s_t0;
+    char line[40];int n=0,i;
+    if(!s_t0)s_t0=hb_time_uptime_us();
+    if(b==0)b=(hb_time_uptime_us()-s_t0)/1000u;   /* ms since the first crumb */
+    while(*tag&&n<12)line[n++]=*tag++;
+    line[n++]=' ';
+    for(i=28;i>=0;i-=4)line[n++]=hex[(a>>i)&15];
+    line[n++]=' ';
+    for(i=28;i>=0;i-=4)line[n++]=hex[(b>>i)&15];
+    line[n++]='\n';
+    if(!s_ring) {
+        s_ring=malloc(sizeof(crumb_ring_t));
+        if(!s_ring)return;
+        s_ring->magic0=CRUMB_MAGIC0;s_ring->magic1=CRUMB_MAGIC1;s_ring->len=0;s_ring->seq=hb_time_uptime_us();
+    }
+    if(s_ring->len>sizeof(s_ring->text))s_ring->len=0;
+    if(s_ring->len+(uint32_t)n>sizeof(s_ring->text)) {
+        uint32_t cut=s_ring->len/2;
+        while(cut<s_ring->len&&s_ring->text[cut-1]!='\n')cut++;
+        memmove(s_ring->text,s_ring->text+cut,s_ring->len-cut);s_ring->len-=cut;
+    }
+    for(i=0;i<n;i++)s_ring->text[s_ring->len++]=line[i];
+    __asm__ volatile("dsb":::"memory");
+}
+/* Previous run's ring: scan the heap region for the magic (16-byte aligned blocks). */
+static void save_previous_crumbs(void) {
+    for(uint32_t a=0x08800000u;a<0x0B800000u;a+=16u) {
+        crumb_ring_t *r=(crumb_ring_t *)(uintptr_t)a;
+        if(r->magic0==CRUMB_MAGIC0&&r->magic1==CRUMB_MAGIC1&&r!=s_ring&&r->len<=sizeof(r->text)) {
+            uint32_t cap=(r->len+4095u)&~4095u;char *buf=memalign(64,cap?cap:4096u);
+            if(buf) {
+                memcpy(buf,r->text,r->len);
+                hb_fs_mkdir("/Apps/Data");hb_fs_mkdir(DATA_DIR);
+                hb_fs_write(DATA_DIR "/prevboot.txt",buf,r->len);free(buf);
+            }
+            r->magic0=0;   /* consumed */
+            return;
+        }
+    }
+}
 
 static void keep_awake(void) {          /* as the other nano game ports (firmware 39579dba addresses) */
     static uint64_t last;
@@ -84,7 +132,10 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
 /* Each mode runs for PHASE_US; a line is logged as each one ends (three writes in all),
  * then the full scene carries on. */
 #define PHASE_US 3000000u
-static struct { uint32_t frames,max_period,work_max,over33;uint64_t period,work; } phase[3];
+#define PHASES 4
+/* the scene mode of each phase: with lightmap, without, with again, track only */
+static const uint8_t phase_mode[PHASES]={0,1,0,2};
+static struct { uint32_t frames,max_period,work_max,over33;uint64_t period,work; } phase[PHASES];
 
 void tr_nano_frame(int w,int h,uint32_t frame) {
     static uint64_t last,start;static uint32_t previous_frame;static int reported;
@@ -95,6 +146,8 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         uint64_t t0=plat_time_us();
         plat_log("Temple Run hardware test: panel %dx%d, heap free %u, largest %u, redraw %s",w,h,hb_os_heap_free(),
                  hb_os_heap_largest(),tr_fast_redraw?"2 ms heartbeat":"16 ms heartbeat");
+        save_previous_crumbs();
+        port_crumb("init",(uint32_t)hb_os_heap_free(),0);
         if(manifest() || scene_init()) {
             plat_log("initialization failed");port_log_flush(DATA_DIR "/log.txt");failed=1;return;
         }
@@ -108,33 +161,39 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     uint64_t now=plat_time_us();
     if(!start)start=now+500000u;                    /* let the first frames settle */
     uint32_t period=last?(uint32_t)(now-last):0;
-    int mode=0;
+    int index=0,mode=0;
     static int logged;
+    static uint32_t count;
     if(!reported && now>=start) {
         uint32_t elapsed=(uint32_t)(now-start);
-        mode=(int)(elapsed/PHASE_US);
-        static const char *names[3]={"track+lightmap+characters","no lightmap","track only, no lightmap"};
-        while(logged<mode && logged<3) {
+        index=(int)(elapsed/PHASE_US);
+        while(logged<index && logged<PHASES) {
             int i=logged++;
             uint32_t n=phase[i].frames?phase[i].frames:1;
             uint32_t fps10=phase[i].period?(uint32_t)((uint64_t)phase[i].frames*10000000u/phase[i].period):0;
-            plat_log("%s: frames=%u fps=%u.%u work_us=%u work_max=%u period_max=%u over_33ms=%u; %d draws, %d vertices",
-                     names[i],phase[i].frames,fps10/10,fps10%10,(unsigned)(phase[i].work/n),phase[i].work_max,
+            port_crumb("log",(uint32_t)i,0);
+            plat_log("phase %d mode %d: frames=%u fps=%u.%u work_us=%u work_max=%u period_max=%u over_33ms=%u; %d draws, %d vertices",
+                     i,(int)phase_mode[i],phase[i].frames,fps10/10,fps10%10,(unsigned)(phase[i].work/n),phase[i].work_max,
                      phase[i].max_period,phase[i].over33,scene_stat_draws,scene_stat_vertices);
+            port_crumb("flush",(uint32_t)i,0);
             port_log_flush(DATA_DIR "/log.txt");
+            port_crumb("flushed",(uint32_t)i,0);
             last=0;
         }
-        if(mode>2){reported=1;mode=0;}
+        if(index>=PHASES){reported=1;index=0;}
+        mode=phase_mode[index];
     }
     last=plat_time_us();now=last;        /* a log write above must not count as a frame */
     float dt=period?(float)period*1e-6f:1.f/30.f;
     if(dt>0.1f)dt=0.1f;
+    port_crumb("draw",(count<<4)|(uint32_t)mode,0);
     scene_frame(w,h,dt,mode);
+    port_crumb("drawn",count++,0);
     if(!reported && now>=start && period) {
         uint32_t work=(uint32_t)(plat_time_us()-now);
-        phase[mode].frames++;phase[mode].period+=period;phase[mode].work+=work;
-        if(period>phase[mode].max_period)phase[mode].max_period=period;
-        if(work>phase[mode].work_max)phase[mode].work_max=work;
-        phase[mode].over33+=period>33333u;
+        phase[index].frames++;phase[index].period+=period;phase[index].work+=work;
+        if(period>phase[index].max_period)phase[index].max_period=period;
+        if(work>phase[index].work_max)phase[index].work_max=work;
+        phase[index].over33+=period>33333u;
     }
 }
