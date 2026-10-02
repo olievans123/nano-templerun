@@ -6,4 +6,6 @@ uint64_t plat_time_us(void);
 void *plat_read_file(const char *name, uint32_t *size, int save);
 int plat_write_file(const char *name, const void *data, uint32_t size);
 void plat_log(const char *fmt, ...);
+/* Stop the game with a message; does not return. */
+void plat_fatal(const char *message);
 #endif
