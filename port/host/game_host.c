@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
     glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, rb[1]);
     glViewport(0, 0, W, H);
     glEnable(GL_DEPTH_TEST);
-    if (!game_init(W, H, 8u << 20, argc > 5 ? (uint32_t)atoi(argv[5]) : 1u)) return 1;
+    if (!game_init(W, H, getenv("TR_HEAP") ? (uint32_t)strtoul(getenv("TR_HEAP"), 0, 0) : 8u << 20, argc > 5 ? (uint32_t)atoi(argv[5]) : 1u)) return 1;
     fprintf(stderr, "loaded: guest heap %u bytes high water, %u in use; buffer objects %u bytes\n", (unsigned)rt_heap_peak(),
             (unsigned)rt_heap_used(), fe_buffer_bytes);
     long tris = 0, tiny = 0, clipped = 0, dropped = 0, fogged = 0, draws = 0;

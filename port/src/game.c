@@ -11,6 +11,13 @@
 #include "rt.h"
 #include <math.h>
 
+#ifdef AB_NANO
+extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail that survives a reboot */
+#define CRUMB(tag) port_crumb(tag, 0, 0)
+#else
+#define CRUMB(tag) ((void)0)
+#endif
+
 static uint32_t sGame, sScratch;
 static uint32_t fSimulate, fDraw, fStart, fRestart, fTouchBegan, fTouchMoved, fTouchEnded, fTilt, fIsGameOver,
                 fIsGameOverFinished, fGetScore, fGetCoins, fGetDistance, fIsPaused, fUnpause;
@@ -23,6 +30,7 @@ static float sTilt;
 int game_init(int panel_w, int panel_h, uint32_t heap_bytes, uint32_t seed) {
     sW = panel_w; sH = panel_h;
     fe_reset();
+    CRUMB("rt");
     if (!rt_init(heap_bytes)) return 0;
     rt_srandom(seed);
     fSimulate = rt_lookup("__ZN15cGameController8simulateEf");
@@ -40,13 +48,17 @@ int game_init(int panel_w, int panel_h, uint32_t heap_bytes, uint32_t seed) {
     fGetDistance = rt_lookup("__ZNK15cGameController14getDistanceRunEv");
     fIsPaused = rt_lookup("__ZNK15cGameController8isPausedEv");
     fUnpause = rt_lookup("__ZN15cGameController7unpauseEv");
+    CRUMB("ctor");
     sGame = rt_alloc(596);
     rt_invoke(rt_lookup("__ZN15cGameControllerC1Efffb"), 5, sGame, rt_fbits((float)panel_w), rt_fbits((float)panel_h), rt_fbits(1.0f), 0u);
     MF(sGame + DISPLAY_SCALE_OFFSET) = (float)panel_w / 320.0f;
     sScratch = rt_alloc(32);
+    CRUMB("engine");
     rt_invoke(rt_lookup("__ZN15cGameController9initalizeEv"), 1, sGame);
+    CRUMB("level");
     rt_invoke(rt_lookup("__ZN15cGameController20loadLevelInformationEv"), 1, sGame);
     rt_invoke(fSimulate, 2, sGame, rt_fbits(0.01f));
+    CRUMB("ready");
     sState = GAME_TITLE;
     return 1;
 }
@@ -157,7 +169,10 @@ void game_frame(float dt) {
     rt_invoke(fSimulate, 2, sGame, rt_fbits(dt));
     if (sState == GAME_RUNNING && rt_invoke(fIsGameOverFinished, 1, sGame)) sState = GAME_OVER;
     fe_time_engine_us = (uint32_t)(plat_time_us() - t0);
+    CRUMB("clear");
     fe_frame_begin(sW, sH);
+    CRUMB("draw");
     rt_invoke(fDraw, 1, sGame);
+    CRUMB("submit");
     fe_frame_end();
 }

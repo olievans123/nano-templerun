@@ -150,6 +150,9 @@ void plat_fatal(const char *message) {
 #ifndef GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG
 #define GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG 0x8C00
 #endif
+#ifndef GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
+#define GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG 0x8C02
+#endif
 #ifndef GL_LINEAR_MIPMAP_NEAREST
 #define GL_LINEAR_MIPMAP_NEAREST 0x2701
 #endif
@@ -164,7 +167,7 @@ static uint32_t u32le(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|
 unsigned rt_host_load_texture(const char *name,const char *file,int repeat) {
     char base[48],path[56];uint32_t size=0;GLuint t=0;int ok=0;
     snprintf(base,sizeof base,"%s",file);
-    char *dot=strrchr(base,'.');int pvr=dot&&!strcmp(dot,".pvr");
+    char *dot=strrchr(base,'.');
     if(dot)*dot=0;
     port_crumb("texture",(uint32_t)name[0]<<8|(uint32_t)name[1],0);
     glGenTextures(1,&t);if(!t){plat_log("texture %s: no texture name",name);return 0;}
@@ -173,23 +176,26 @@ unsigned rt_host_load_texture(const char *name,const char *file,int repeat) {
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,repeat?GL_REPEAT:GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,repeat?GL_REPEAT:GL_CLAMP_TO_EDGE);
-    snprintf(path,sizeof path,pvr?"%s.pvr":"%s.4444",base);
+    snprintf(path,sizeof path,"%s.pvr",base);          /* the PNG sheets were re-encoded as PVRTC too */
     uint8_t *d=plat_read_file(path,&size,0);
     while(glGetError()){}
-    if(d && pvr && size>52 && u32le(d)==52 && !memcmp(d+44,"PVR!",4)) {
+    if(d && size>52 && u32le(d)==52 && !memcmp(d+44,"PVR!",4)) {
         /* a 52-byte PVR v2 header, then PVRTC 4bpp levels, largest first */
         uint32_t h=u32le(d+4),w=u32le(d+8),mips=u32le(d+12),total=u32le(d+20),level=0,lw=w,lh=h,used=0,skip=0,sent=0;
         const uint8_t *p=d+52,*end=d+52+total;
         /* The panel is 240 pixels wide: a 1024-pixel texture's largest level is never the one
          * shown, so it is left out (a quarter of the memory, and less for the GPU to read). */
         if(mips>=2 && (w>512||h>512))skip=1;
+        GLenum format=u32le(d+40)?GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG:GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG;
         if(end<=d+size) {
             for(;level<=mips&&p<end;level++) {
                 uint32_t bw=lw<8?8:lw,bh=lh<8?8:lh,bytes=bw*bh/2;
                 if(p+bytes>end)break;
                 if(level>=skip) {
-                    glCompressedTexImage2D(GL_TEXTURE_2D,(GLint)(level-skip),GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG,(GLsizei)lw,(GLsizei)lh,0,(GLsizei)bytes,p);
-                    if(glGetError())break;
+                    port_crumb("level",(level<<16)|lw,0);
+                    glCompressedTexImage2D(GL_TEXTURE_2D,(GLint)(level-skip),format,(GLsizei)lw,(GLsizei)lh,0,(GLsizei)bytes,p);
+                    GLenum error=glGetError();
+                    if(error){plat_log("texture %s level %u (%ux%u, format %x): GL error %x",name,(unsigned)level,(unsigned)lw,(unsigned)lh,(unsigned)format,(unsigned)error);break;}
                     used+=bytes;sent++;
                 }
                 p+=bytes;
@@ -199,9 +205,6 @@ unsigned rt_host_load_texture(const char *name,const char *file,int repeat) {
             if(level>mips)glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_NEAREST);
             ok=sent>=1;texture_bytes+=used;
         }
-    } else if(d && !pvr && size>8 && size==8+u32le(d)*u32le(d+4)*2) {
-        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,(GLsizei)u32le(d),(GLsizei)u32le(d+4),0,GL_RGBA,GL_UNSIGNED_SHORT_4_4_4_4,d+8);
-        ok=!glGetError();texture_bytes+=size-8;
     }
     free(d);
     if(!ok){plat_log("texture %s (%s): could not be loaded",name,path);glDeleteTextures(1,&t);return 0;}
@@ -229,7 +232,12 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         uint64_t t0=plat_time_us();
         plat_log("Temple Run: panel %dx%d, heap free %u, largest %u, redraw %s",w,h,hb_os_heap_free(),
                  hb_os_heap_largest(),tr_fast_redraw?"2 ms heartbeat":"16 ms heartbeat");
-        save_previous_crumbs("prevboot.txt");
+        {   /* the previous run's trail, if it ended in a reboot: kept under a new name each time */
+            char trail[64];int n=0;
+            for(;n<9;n++){snprintf(trail,sizeof trail,DATA_DIR "/prevboot-%d.txt",n);if(!hb_fs_size(trail))break;}
+            snprintf(trail,sizeof trail,"prevboot-%d.txt",n);
+            save_previous_crumbs(trail);
+        }
         port_crumb("init",0,0);
         uint32_t marker=0;void *flag=NULL;
         if(manifest()){plat_log("files.lst is missing");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;}
@@ -259,6 +267,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     hb_spoint_t finger;hb_surface_touch_read(&finger);
     if(finger.down){game_touch(touching?1:0,(float)finger.x,(float)finger.y);touching=1;}
     else if(touching){game_touch(2,(float)finger.x,(float)finger.y);touching=0;}
+    port_crumb("input",count,0);
     int32_t g[3]={0,0,0};hb_accel_read_milli_g(g);
     float tilt=(float)-g[0]*0.001f;                     /* the phone reports gravity; the nano the opposite */
     game_tilt(tilt>1.f?1.f:tilt<-1.f?-1.f:tilt);
