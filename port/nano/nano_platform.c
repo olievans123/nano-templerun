@@ -353,7 +353,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
      * same frame a few seconds later never has. So the first frames after the textures go
      * up only clear the screen, and the next ones draw without the fog blending. */
     game_set_drawing(count>=4);
-    fe_option_fog_blend=count>=90;
+    fe_option_fog_blend=count>=210;
     port_crumb("heap",hb_os_heap_free(),hb_os_heap_largest());
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();

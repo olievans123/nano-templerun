@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
     uint64_t t0 = plat_time_us();
     for (int f = 0; f < frames; f++) {
 
-        if (getenv("TR_TAP") && f == atoi(getenv("TR_TAP"))) game_touch(0, 120, 300);
+        if (getenv("TR_TAP") && f == atoi(getenv("TR_TAP"))) { setenv("TR_GLLOG", "1", 1); setenv("TR_TEXLOG", "1", 1); fprintf(stderr, "--- tap\n"); game_touch(0, 120, 300); }
         if (getenv("TR_TAP") && f == atoi(getenv("TR_TAP")) + 3) game_touch(2, 120, 300);
         if (getenv("TR_DUMP") && f == atoi(getenv("TR_DUMP"))) setenv("TR_DUMP_BATCHES", "1", 1); else unsetenv("TR_DUMP_BATCHES");
         game_frame(getenv("TR_DT") ? (float)atof(getenv("TR_DT")) : 1.0f / 30.0f);

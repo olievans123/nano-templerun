@@ -26,7 +26,7 @@ extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail 
 #endif
 
 unsigned fe_time_draw_us;       /* the last frame's time in the engine's draw(), including the port's transform */
-#define TESTS 5
+#define TESTS 15
 #define TEST_SPACING 12
 static unsigned sTest[TESTS];
 #ifdef AB_NANO
@@ -217,6 +217,10 @@ static void load_screens(void) {
     sTest[4] = sUiTexture;
     sTest[1] = rt_host_load_texture("testMip256", "testMip256.png", 0);
     sTest[2] = rt_host_load_texture("testMip1024", "testMip1024.png", 0);
+    {   /* then the engine's own, sheets first: interface, effects, digits, terrain, runner, glow, monkeys, trees, light map, tutorial */
+        static const uint8_t rest[10] = { 1, 3, 4, 6, 7, 8, 9, 11, 12, 2 };
+        for (int i = 0; i < 10; i++) sTest[5 + i] = rt_texture_host(rest[i]);
+    }
 }
 
 static const Sprite *sprite(const char *name) {
@@ -308,11 +312,15 @@ void game_frame(float dt) {
         /* Hardware test at start-up: the iPod rebooted about 25 ms after the first rectangle
          * drawn with one of the sprite sheets. One texture of each kind is shown in turn, a
          * dozen frames apart, so the trail says which kind the driver cannot take. */
-        static const char *const kind[TESTS] = { "wall RGB levels", "256 RGBA levels", "1024 RGBA levels", "256 RGBA single", "1024 RGBA single" };
+        /* Every texture is drawn with for the first time here, one every twelve frames in a
+         * frame that holds little else. The two reboots when a run began came on the frame
+         * that first used the score display's sheet and the digits; the first scene frame
+         * rebooted whenever it was also the first use of the screens' sheet, and never when
+         * that sheet had been shown in one of these squares first. */
         int test = sWarm / TEST_SPACING;
-        if (sWarm % TEST_SPACING == 0) { plat_log("test %d: %s", test, kind[test]); plat_log_flush(); port_test_mark(test); }
+        if (sWarm % TEST_SPACING == 0) { plat_log("first use %d", test); plat_log_flush(); port_test_mark(test); }
         for (int t = 0; t <= test; t++)
-            if (sTest[t]) fe_overlay(sTest[t], 8.0f + 44.0f * (float)t, 8.0f, 40.0f, 40.0f, 0.3f, 0.3f, 0.7f, 0.7f, WHITE);
+            if (sTest[t]) fe_overlay(sTest[t], 8.0f + 44.0f * (float)(t % 5), 8.0f + 44.0f * (float)(t / 5), 40.0f, 40.0f, 0.3f, 0.3f, 0.7f, 0.7f, WHITE);
         sWarm++;
         fe_frame_end();
         return;

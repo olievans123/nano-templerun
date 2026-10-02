@@ -203,6 +203,9 @@ void fe_bind_buffer(uint32_t target, uint32_t name) {
 }
 void fe_buffer_data(uint32_t target, uint32_t size, const void *data, uint32_t usage) {
     (void)usage;
+#ifndef AB_NANO
+    if (getenv("TR_GLLOG")) fprintf(stderr, "glBufferData target %x size %u\n", target, size);
+#endif
     Buffer *b = buffer(target == FE_ARRAY_BUFFER ? sArrayBuffer : sElementBuffer);
     if (!b) return;
     buffer_release(b);
@@ -215,6 +218,9 @@ void fe_buffer_data(uint32_t target, uint32_t size, const void *data, uint32_t u
     fe_buffer_bytes += size;
 }
 void fe_delete_buffers(uint32_t count, const uint32_t *names) {
+#ifndef AB_NANO
+    if (getenv("TR_GLLOG")) fprintf(stderr, "glDeleteBuffers %u\n", count);
+#endif
     for (uint32_t i = 0; i < count; i++) { Buffer *b = buffer(names[i]); if (b) buffer_release(b); }
 }
 void fe_delete_textures(uint32_t count, const uint32_t *names) { (void)count; (void)names; }
