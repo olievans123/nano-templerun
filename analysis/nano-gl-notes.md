@@ -22,3 +22,22 @@ between draws, and less than about 3 MB of OS heap left for the driver.
 
 Doing the transform on the CPU costs no more than letting GL do it (18 ms against 21 ms),
 which fits the earlier finding that the driver transforms on the CPU anyway.
+
+## Found while bringing up the full game (2 October 2026)
+
+- **Slivers reboot it too.** A triangle a tenth of a pixel wide and a hundred long has more
+  than 2 square pixels of area, but the driver puts corners on a sub-pixel grid and there it
+  has none. The score display's sprites reach past the screen edge, and clipping them left
+  such slivers: the first frame that drew them rebooted the iPod. `drawable()` in
+  `port/src/glfe.c` requires 2 square pixels and half a pixel across at the thinnest.
+- **The 2-square-pixel rule holds with one texture unit as well** (a frame drawn with a
+  1/8-pixel guard rebooted it after 180 frames at 2 pixels).
+- **Large uncompressed textures are out** (the other ports keep them to 256x128), but PVRTC
+  with alpha (0x8C02) is fine at 1024x1024, with or without smaller levels. A texture with one
+  level and a mipmap filter is incomplete and draws white.
+- **Fog** can be drawn as blending against the fog-coloured clear colour (colour and alpha
+  scaled by the fog factor); blended two-texture batches are fine.
+- **The newest file written is lost if the iPod reboots soon after**; write a second small
+  file after a log you want to keep.
+- **The resident's touch mailbox goes stale when frames are long** (about 45 ms here); the OS
+  touch list at 0x089a5298 can be read directly as well.
