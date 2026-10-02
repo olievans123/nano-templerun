@@ -105,6 +105,12 @@ def build_ui_sheet():
         x += w + 6
     if x > 1024:
         raise ValueError('the digits do not fit the sheet')
+    box = font.getbbox('BEST')
+    word = Image.new('RGBA', (box[2] + 2, 44))
+    ImageDraw.Draw(word).text((1, 0), 'BEST', font=font, fill=(255, 255, 255, 255))
+    if 744 + word.width > 1024:
+        raise ValueError('the label does not fit the sheet')
+    put('best', word, 744, 300)
     return sheet, places
 
 

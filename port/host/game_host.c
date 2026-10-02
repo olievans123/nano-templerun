@@ -23,10 +23,10 @@ static const char *sDirs[2];
 
 uint64_t plat_time_us(void) { struct timeval tv; gettimeofday(&tv, NULL); return (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec; }
 void *plat_read_file(const char *name, uint32_t *size, int save) {
-    if (save) return NULL;
-    for (int i = 0; i < 2; i++) {
+    if (save && !getenv("TR_SAVE_DIR")) return NULL;
+    for (int i = 0; i < (save ? 1 : 2); i++) {
         char path[1024];
-        snprintf(path, sizeof path, "%s/%s", sDirs[i], name);
+        snprintf(path, sizeof path, "%s/%s", save ? getenv("TR_SAVE_DIR") : sDirs[i], name);
         FILE *f = fopen(path, "rb");
         if (!f) continue;
         fseek(f, 0, SEEK_END);
@@ -41,8 +41,15 @@ void *plat_read_file(const char *name, uint32_t *size, int save) {
     return NULL;
 }
 int plat_write_file(const char *name, const void *data, uint32_t size) {
-    (void)data;
     if (getenv("TR_RUNS")) fprintf(stderr, "write %s: %u bytes\n", name, (unsigned)size);
+    if (getenv("TR_SAVE_DIR")) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s", getenv("TR_SAVE_DIR"), name);
+        FILE *f = fopen(path, "wb");
+        if (!f) return -1;
+        fwrite(data, 1, size, f);
+        fclose(f);
+    }
     return 0;
 }
 void plat_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); fputc('\n', stderr); }
@@ -108,6 +115,7 @@ static void screenshot(const char *path) {
 static int sHist[40], sHistMax, sHistMaxFrame, capped_frames, cut_hist[9], cut_max;
 static long capped, detail_sum;
 static int sFound = -1000, sFinds;
+static long calls, idle_calls, idle_vertices, idle_off, vin, tin, boxed;
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: game_host <iPod data dir> <host texture dir> <out dir> <frames> [seed] [shot every n]\n"); return 2; }
     sDirs[0] = argv[1]; sDirs[1] = argv[2];
@@ -136,6 +144,7 @@ int main(int argc, char **argv) {
     game_autopilot(getenv("TR_NOAUTO") ? 0 : 1);
 
     uint64_t t0 = plat_time_us();
+    if (getenv("TR_NOCULL")) fe_option_box_cull = 0;
     if (getenv("TR_CAP")) fe_option_budget = atoi(getenv("TR_CAP"));
     for (int f = 0; f < frames; f++) {
 
@@ -147,6 +156,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "frame %d: state %d, %d triangles out, %d draws, score %d\n", f, game_state(), fe_stat_triangles_out, fe_stat_draws, game_score());
         glFinish();
         { extern int fe_stat_near; if (getenv("TR_NEAR") && (f < 12 || f % 20 == 0)) fprintf(stderr, "frame %d: %d triangles crossed the near plane, %d clipped, %d out\n", f, fe_stat_near, fe_stat_clipped, fe_stat_triangles_out); }
+        if (f == 0 && getenv("TR_RUNS")) fprintf(stderr, "best on record at start: %d\n", game_best());
         if (game_state() == GAME_OVER && last_state == GAME_RUNNING) {
             runs++;
             if (game_distance() > best) best = game_distance();
@@ -155,6 +165,8 @@ int main(int argc, char **argv) {
         last_state = game_state();
         capped += fe_stat_trimmed; if (fe_stat_trimmed) capped_frames++; if (fe_stat_cut > cut_max) cut_max = fe_stat_cut; cut_hist[fe_stat_trimmed ? 1 + fe_stat_cut / 16 : 0]++;
         { int bin = fe_stat_triangles_out / 100; if (bin > 39) bin = 39; sHist[bin]++; if (fe_stat_triangles_out > sHistMax) { sHistMax = fe_stat_triangles_out; sHistMaxFrame = f; } }
+        { extern int fe_stat_idle_calls, fe_stat_idle_vertices, fe_stat_idle_offscreen, fe_stat_calls, fe_stat_vertices_in, fe_stat_triangles_in;
+          calls += fe_stat_calls; idle_calls += fe_stat_idle_calls; idle_vertices += fe_stat_idle_vertices; idle_off += fe_stat_idle_offscreen; boxed += fe_stat_box_culled; vin += fe_stat_vertices_in; tin += fe_stat_triangles_in; }
         tris += fe_stat_triangles_out; tiny += fe_stat_tiny; clipped += fe_stat_clipped; dropped += fe_stat_dropped;
         fogged += fe_stat_fogged; draws += fe_stat_draws;
         if (getenv("TR_SHOT_AT")) {         /* a list of frames, e.g. 617,1134 */
@@ -177,6 +189,9 @@ int main(int argc, char **argv) {
     { extern float fe_ext_min_w, fe_ext_max_w, fe_ext_min_depth, fe_ext_max_depth, fe_ext_max_uv; extern int fe_stat_near;
       fprintf(stderr, "extremes: w %.3f..%.1f, depth %.5f..%.5f, |uv| up to %.2f; near crossings in the last frame %d\n", (double)fe_ext_min_w,
               (double)fe_ext_max_w, (double)fe_ext_min_depth, (double)fe_ext_max_depth, (double)fe_ext_max_uv, fe_stat_near); }
+    fprintf(stderr, "per frame: %ld draw calls from the engine, %ld vertices and %ld triangles in; %ld calls gave nothing (%ld vertices, %ld of them in meshes off one side)\n",
+            calls / frames, vin / frames, tin / frames, idle_calls / frames, idle_vertices / frames, idle_off / frames);
+    fprintf(stderr, "left out by their box: %ld vertices a frame\n", boxed / frames);
     if (getenv("TR_HIST")) {
         fprintf(stderr, "budget %d: %ld triangles left out in %d frames; highest cut level %d of 127; frames by cut (none, then 16 wide):", fe_option_budget, capped, capped_frames, cut_max);
         for (int i = 0; i < 9; i++) fprintf(stderr, " %d", cut_hist[i]);

@@ -75,7 +75,10 @@ int plat_write_file(const char *name,const void *data,uint32_t size) {
     char path[112];if(!size||size>65536||strstr(name,"..")||name[0]=='/')return -1;
     uint32_t cap=(size+4095u)&~4095u;void *buf=memalign(64,cap);if(!buf)return -1;
     memset(buf,0,cap);memcpy(buf,data,size);snprintf(path,sizeof path,DATA_DIR "/%s",name);
-    hb_fs_mkdir(DATA_DIR);int result=hb_fs_write(path,buf,size)?0:-1;free(buf);return result;
+    hb_fs_mkdir(DATA_DIR);int result=hb_fs_write(path,buf,size)?0:-1;
+    /* the newest file is the one lost if the iPod restarts soon after: let that be this one */
+    memset(buf,0,cap);memcpy(buf,"saved\n",6);hb_fs_write(DATA_DIR "/sync.txt",buf,6);
+    free(buf);return result;
 }
 void plat_log(const char *format,...) {
     va_list args;va_start(args,format);vprintf(format,args);va_end(args);putchar('\n');
@@ -342,7 +345,6 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         touch_report=0;
         plat_log("press %u at %d,%d (mailbox %u, list %u samples); state %d",(unsigned)touch_presses,(int)touch_last_x,(int)touch_last_y,
                  (unsigned)touch_from_mailbox,(unsigned)touch_from_list,game_state());
-        flush_log();last=0;
     }
     port_crumb("input",count,0);
     int32_t g[3]={0,0,0};hb_accel_read_milli_g(g);
@@ -364,7 +366,8 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     if(period>perf.max_period)perf.max_period=period;
     if(work>perf.max_work)perf.max_work=work;
     perf.over40+=period>40000u;
-    static uint32_t most_triangles,trimmed_frames,trimmed;
+    static uint32_t most_triangles,trimmed_frames,trimmed;static uint64_t vertex_us,boxed;
+    vertex_us+=fe_time_vertex_us;boxed+=(uint32_t)fe_stat_box_culled;
     if((uint32_t)fe_stat_triangles_out>most_triangles)most_triangles=(uint32_t)fe_stat_triangles_out;
     if(fe_stat_trimmed){trimmed_frames++;trimmed+=(uint32_t)fe_stat_trimmed;}
     (void)t1;
@@ -386,11 +389,11 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
                  (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),
                  (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),
                  (unsigned)(perf.first/perf.frames),perf.max_work,perf.max_period,perf.over40);
-        plat_log("  per frame %u vertices in, %u triangles out (most %u; %u left out in %u frames), %u draws; dropped %u; state %d, distance %d, presses %u (mailbox %u, list %u); heap free %u, engine heap %u",
-                 perf.vertices/perf.frames,perf.triangles/perf.frames,(unsigned)most_triangles,(unsigned)trimmed,(unsigned)trimmed_frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
+        plat_log("  per frame %u vertices in (vertex part %u us; %u more left out by box), %u triangles out (most %u; %u left out in %u frames), %u draws; dropped %u; state %d, distance %d, best %d, presses %u (mailbox %u, list %u); heap free %u, engine heap %u",
+                 perf.vertices/perf.frames,(unsigned)(vertex_us/perf.frames),(unsigned)(boxed/perf.frames),perf.triangles/perf.frames,(unsigned)most_triangles,(unsigned)trimmed,(unsigned)trimmed_frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),game_best(),
                  (unsigned)touch_presses,(unsigned)touch_from_mailbox,(unsigned)touch_from_list,hb_os_heap_free(),(unsigned)rt_heap_peak());
         flush_log();
-        memset(&perf,0,sizeof perf);most_triangles=trimmed=trimmed_frames=0;
+        memset(&perf,0,sizeof perf);most_triangles=trimmed=trimmed_frames=0;vertex_us=boxed=0;
         last=0;
     }
     previous_end=plat_time_us();

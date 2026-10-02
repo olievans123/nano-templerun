@@ -21,6 +21,7 @@ void game_autopilot(int on);
 
 enum { GAME_TITLE, GAME_RUNNING, GAME_OVER };
 int game_state(void);
+int game_best(void);                    /* the best score on record */
 int game_score(void);
 int game_coins(void);
 int game_distance(void);

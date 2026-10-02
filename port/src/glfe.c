@@ -53,6 +53,7 @@ typedef struct {
     uint32_t size;
     uint8_t packed, channels, stride, packed_stride;    /* stride: of the engine's layout */
     float pos_scale, uv_scale[2];
+    float lo[3], hi[3];                                 /* packed: a box around every position */
 } Buffer;
 #define BUFFERS 640
 static Buffer sBuffers[BUFFERS];
@@ -173,9 +174,11 @@ static int pack_vertices(Buffer *b, const uint8_t *data, uint32_t size) {
     for (uint32_t c = 0; c < channels; c++) if (M32(offsets + 4 * c) != 12 + 8 * c) return 0;
     uint32_t count = size / stride, packed_stride = 6 + 4 * channels;
     float pos_max = 0.f, uv_max[2] = { 0.f, 0.f };
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
     for (uint32_t i = 0; i < count; i++) {
         float v[7];
         memcpy(v, data + (size_t)i * stride, stride);
+        for (int k = 0; k < 3; k++) { if (v[k] < lo[k]) lo[k] = v[k]; if (v[k] > hi[k]) hi[k] = v[k]; }
         for (int k = 0; k < 3; k++) { float a = v[k] < 0.f ? -v[k] : v[k]; if (a > pos_max) pos_max = a; }
         for (uint32_t c = 0; c < channels; c++)
             for (int k = 0; k < 2; k++) { float a = v[3 + 2 * c + k]; if (a < 0.f) a = -a; if (a > uv_max[c]) uv_max[c] = a; }
@@ -184,6 +187,7 @@ static int pack_vertices(Buffer *b, const uint8_t *data, uint32_t size) {
     int16_t *out = malloc((size_t)count * packed_stride);
     if (!out) return 0;
     b->pos_scale = pos_max > 0.f ? pos_max / 32767.f : 1.f;
+    for (int k = 0; k < 3; k++) { b->lo[k] = lo[k] - b->pos_scale; b->hi[k] = hi[k] + b->pos_scale; }   /* a rounding step wider */
     for (uint32_t c = 0; c < 2; c++) b->uv_scale[c] = uv_max[c] > 0.f ? uv_max[c] / 32767.f : 1.f;
     float ip = 1.f / b->pos_scale, iu[2] = { 1.f / b->uv_scale[0], 1.f / b->uv_scale[1] };
     int16_t *o = out;
@@ -258,6 +262,9 @@ float fe_option_min_area2 = 4.0f;
  * the next, of about 1,550, rebooted it. One frame in seven of the game is over 1,500,
  * and the most seen is 2,300. */
 int fe_option_budget = 1300;
+int fe_option_box_cull = 1;
+int fe_stat_box_culled;                 /* this frame: vertices in models left out by their box */
+unsigned fe_time_vertex_us;             /* this frame: the vertex half of the transform time */
 int fe_stat_trimmed, fe_stat_cut;       /* this frame: triangles left out for the budget, and the level (see showing) of the last of them */
 unsigned fe_time_clear_us, fe_time_first_draw_us;       /* this frame: the clear; the first draw call given to GL */
 unsigned fe_time_transform_us, fe_time_submit_us;      /* this frame: in draw calls here; handing the frame to GL */
@@ -287,7 +294,10 @@ static Batch *batch_for(int kind, unsigned tex0, unsigned tex1, int blend, int d
     return b;
 }
 
+int fe_stat_idle_calls, fe_stat_idle_vertices, fe_stat_idle_offscreen;    /* draw calls that gave no triangle, their vertices, and those wholly off one side */
+static int sFrameCount;                 /* triangles reserved this frame */
 static OutVtx *reserve(Batch *b) {
+    sFrameCount++;
     if (b->last + 3 > CHUNK_VERTS) {
         if (sChunksUsed == CHUNKS || b->chunks == BATCH_CHUNKS) { fe_stat_dropped++; return NULL; }
         b->chunk[b->chunks++] = (uint8_t)sChunksUsed++;
@@ -384,6 +394,7 @@ static Buffer *packed_buffer(const Array *a) {
     return b && b->data && b->packed ? b : NULL;
 }
 
+static uint64_t sDrawStart;
 static void draw_triangles(int count, const uint16_t *idx, int first) {
     fe_stat_calls++;
     Buffer *packed = sVertexArray.enabled ? packed_buffer(&sVertexArray) : NULL;
@@ -443,6 +454,26 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
     const uint32_t flat = byte_of(sColor[0] * 255.f) | byte_of(sColor[1] * 255.f) << 8 | byte_of(sColor[2] * 255.f) << 16
                           | byte_of(sColor[3] * 255.f) << 24;
     const float hw = sHalfW, hh = sHalfH;
+    if (packed && fe_option_box_cull) {
+        /* The model's box first: if its eight corners are all off the same side of the view,
+         * or all past the end of the fog, so is every vertex, and none need be transformed.
+         * (A quarter of the vertices the engine sends are in such models.) */
+        uint8_t off = 0x3f;
+        float nearest = 1e30f;
+        int sign = 0;
+        for (int c = 0; c < 8; c++) {
+            float x = c & 1 ? packed->hi[0] : packed->lo[0], y = c & 2 ? packed->hi[1] : packed->lo[1], z = c & 4 ? packed->hi[2] : packed->lo[2];
+            float cx = m[0] * x + m[4] * y + m[8] * z + m[12], cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+            float cz = m[2] * x + m[6] * y + m[10] * z + m[14], cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+            float e = cw + (cw < 0.f ? -cw : cw) * 0.001f;          /* a little outside what the vertices are held to */
+            off &= (uint8_t)((cx < -e) | (cx > e) << 1 | (cy < -e) << 2 | (cy > e) << 3 | (cz < -e) << 4 | (cz > e) << 5);
+            float ez = f2 * x + f6 * y + f10 * z + f14;
+            sign |= ez < 0.f ? 1 : 2;
+            if (ez < 0.f) ez = -ez;
+            if (ez < nearest) nearest = ez;
+        }
+        if (off || (fog_blend && sign != 3 && nearest > fog_end * 1.001f)) { fe_stat_box_culled += n; return; }
+    }
     uint8_t all = 0xff;
     for (int i = idx ? 0 : first; i < n; i++) {
         float x, y, z;
@@ -490,7 +521,8 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
     }
     fe_stat_vertices_in += n;
     fe_stat_triangles_in += count / 3;
-    if (all) return;                                    /* the whole mesh is off one side */
+    fe_time_vertex_us += (unsigned)(plat_time_us() - sDrawStart);
+    if (all) { fe_stat_idle_offscreen += n; return; }   /* the whole mesh is off one side */
     const int cull = s.cull;
     const float min_area2 = s.min_area2;
     for (int i = 0; i + 2 < count; i += 3) {
@@ -556,7 +588,10 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
 static void draw(int count, const uint16_t *idx, int first) {
     plat_poll();
     uint64_t t0 = plat_time_us();
+    sDrawStart = t0;
+    int before = sFrameCount, vin = fe_stat_vertices_in;
     draw_triangles(count, idx, first);
+    if (sFrameCount == before) { fe_stat_idle_calls++; fe_stat_idle_vertices += fe_stat_vertices_in - vin; }
     fe_time_transform_us += (unsigned)(plat_time_us() - t0);
 }
 
@@ -608,6 +643,9 @@ void fe_frame_begin(int panel_w, int panel_h) {
     sOrderedOpen = -1;
     fe_stat_draws = fe_stat_vertices_in = fe_stat_triangles_in = fe_stat_triangles_out = fe_stat_tiny = 0;
     fe_stat_clipped = fe_stat_dropped = fe_stat_calls = fe_stat_fogged = 0;
+    fe_stat_idle_calls = fe_stat_idle_vertices = fe_stat_idle_offscreen = 0;
+    fe_stat_box_culled = 0;
+    fe_time_vertex_us = 0;
     fe_time_transform_us = fe_time_submit_us = 0;
     fe_stat_near = 0;
     uint64_t t0 = plat_time_us();

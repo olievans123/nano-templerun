@@ -52,6 +52,8 @@ extern int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_tri
            fe_stat_clipped, fe_stat_dropped, fe_stat_calls, fe_stat_fogged;
 extern int fe_option_fog_blend;
 extern float fe_option_min_area2;
+extern int fe_option_box_cull, fe_stat_box_culled;
+extern unsigned fe_time_vertex_us;
 extern int fe_option_budget;            /* the most triangles a frame may give the driver; see glfe.c */
 extern int fe_stat_trimmed, fe_stat_cut;
 extern unsigned fe_time_transform_us, fe_time_submit_us, fe_time_clear_us, fe_time_first_draw_us;

@@ -26,8 +26,8 @@ extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail 
 #endif
 
 unsigned fe_time_draw_us;       /* the last frame's time in the engine's draw(), including the port's transform */
-#define TESTS 13
-#define TEST_SPACING 12
+#define TESTS 13                        /* textures given a first draw of their own at start-up */
+#define TEST_SPACING 6
 static unsigned sTest[TESTS];
 #ifdef AB_NANO
 static void port_test_mark(int test) { port_crumb("test", (uint32_t)test, 0); }
@@ -44,6 +44,7 @@ static float sTilt;
  * that display (1 on the phone, 2 on the iPad), which the shell sets for the panel's width. */
 #define DISPLAY_SCALE_OFFSET 0x10
 
+static void load_records(void);
 int game_init(int panel_w, int panel_h, uint32_t heap_bytes, uint32_t seed) {
     sW = panel_w; sH = panel_h;
     fe_reset();
@@ -75,12 +76,40 @@ int game_init(int panel_w, int panel_h, uint32_t heap_bytes, uint32_t seed) {
     rt_invoke(rt_lookup("__ZN15cGameController9initalizeEv"), 1, sGame);
     CRUMB("level");
     rt_invoke(rt_lookup("__ZN15cGameController20loadLevelInformationEv"), 1, sGame);
+    load_records();
     rt_invoke(fSimulate, 2, sGame, rt_fbits(0.01f));
     load_screens();
     CRUMB("ready");
     sState = GAME_TITLE;
     return 1;
 }
+
+/* ---- records ------------------------------------------------------------------------------------
+ * The engine keeps the player's bests and totals in a record (cRecordManager) that the phone
+ * saved to a file through code the port does not have. The shell saves the record as it is
+ * after each run and puts it back at start-up, so the engine's own "high score" banner and
+ * the best score on the game-over screen carry over. */
+#define RECORD_BYTES 0x3c               /* player, best score, coins, distance, plays, totals */
+static uint32_t sRecord;
+static void load_records(void) {
+    uint32_t players = rt_invoke(rt_lookup("__ZN14cPlayerManager11getInstanceEv"), 0);
+    uint32_t player = rt_invoke(rt_lookup("__ZNK14cPlayerManager15getActivePlayerEv"), 1, players);
+    uint32_t records = rt_invoke(rt_lookup("__ZN14cRecordManager11getInstanceEv"), 0);
+    sRecord = rt_invoke(rt_lookup("__ZN14cRecordManager24findOrCreatePlayerRecordEi"), 2, records, player);
+    uint32_t size = 0;
+    uint8_t *saved = plat_read_file("records.bin", &size, 1);
+    if (sRecord && saved && size == 4 + RECORD_BYTES && !memcmp(saved, "TRR1", 4))
+        memcpy(g_mem + sRecord + 4, saved + 8, RECORD_BYTES - 4);       /* all but the player's number */
+    free(saved);
+}
+static void save_records(void) {
+    uint8_t out[4 + RECORD_BYTES];
+    if (!sRecord) return;
+    memcpy(out, "TRR1", 4);
+    memcpy(out + 4, g_mem + sRecord, RECORD_BYTES);
+    plat_write_file("records.bin", out, sizeof out);
+}
+int game_best(void) { return sRecord ? (int)M32(sRecord + 4) : 0; }
 
 int game_state(void) { return sState; }
 int game_score(void) { return (int)rt_invoke(fGetScore, 1, sGame); }
@@ -212,11 +241,11 @@ static void load_screens(void) {
     }
     free(text);
     sUiTexture = rt_host_load_texture("uiSheet", "uiSheet.png", 0);
-    {   /* every texture the game draws with, the three sheets last: wall, countdown, digits, terrain,
-         * runner, glow, monkeys, trees, light map, tutorial, then the effects and interface sheets */
+    {   /* every texture the game draws with, the screens' sheet first (it holds the logo): then wall,
+         * countdown, digits, terrain, runner, glow, monkeys, trees, light map, tutorial, effects, interface */
         static const uint8_t order[12] = { 10, 5, 4, 6, 7, 8, 9, 11, 12, 2, 3, 1 };
-        for (int i = 0; i < 12; i++) sTest[i] = rt_texture_host(order[i]);
-        sTest[12] = sUiTexture;
+        sTest[0] = sUiTexture;
+        for (int i = 0; i < 12; i++) sTest[1 + i] = rt_texture_host(order[i]);
     }
 }
 
@@ -234,8 +263,9 @@ static float picture(const char *name, float x, float y, float width, uint32_t c
     return height;
 }
 
-/* A number with thousands separators, centred on cx; `scale` is panel pixels per sheet pixel. */
-static void number(int value, const char *suffix, float cx, float y, float scale, uint32_t colour) {
+/* A number with thousands separators, centred on cx; `scale` is panel pixels per sheet pixel.
+ * Returns its width; with no colour it is only measured. */
+static float number(int value, const char *suffix, float cx, float y, float scale, uint32_t colour) {
     char digits[16], text[24];
     int n = 0, len = 0;
     if (value < 0) value = 0;
@@ -250,13 +280,14 @@ static void number(int value, const char *suffix, float cx, float y, float scale
         if (sp) width += sp->w * scale;
     }
     float x = cx - width * 0.5f;
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < len && colour; i++) {
         snprintf(name, sizeof name, text[i] == ',' ? "glyphComma" : "glyph%c", text[i]);
         const Sprite *sp = sprite(name);
         if (!sp) continue;
         picture(name, x, y, sp->w * scale, colour);
         x += sp->w * scale;
     }
+    return width;
 }
 
 static void draw_screens(void) {
@@ -282,6 +313,15 @@ static void draw_screens(void) {
         float cw = 22.0f * k;
         picture("coin", w * 0.5f - 44.0f * k, y + 3.0f * k, cw, WHITE);
         number(game_coins(), NULL, w * 0.5f + 14.0f * k, y, 0.62f * k, ink);
+        const Sprite *label = sprite("best");
+        if (label && game_best() > 0) {                         /* "BEST 12,345", centred as one line */
+            float scale = 0.56f * k, gap = 8.0f * k, lw = label->w * scale;
+            float nw = number(game_best(), NULL, 0.0f, 0.0f, scale, 0);
+            float x = (w - lw - gap - nw) * 0.5f;
+            y += 34.0f * k;
+            picture("best", x, y, lw, ink);
+            number(game_best(), NULL, x + lw + gap + nw * 0.5f, y, scale, ink);
+        }
         picture("runAgain", (w - 270.0f * k) * 0.5f, py + 494.0f * 300.0f / 320.0f * k - 92.0f * k, 270.0f * k, WHITE);
     } else if (rt_invoke(fIsPaused, 1, sGame)) {
         picture("paused", (w - 220.0f * k) * 0.5f, 120.0f * k, 220.0f * k, WHITE);
@@ -299,25 +339,22 @@ void game_frame(float dt) {
     }
     uint64_t t0 = plat_time_us();
     rt_invoke(fSimulate, 2, sGame, rt_fbits(dt));
-    if (sState == GAME_RUNNING && rt_invoke(fIsGameOverFinished, 1, sGame)) { sState = GAME_OVER; sRuns++; }
+    if (sState == GAME_RUNNING && rt_invoke(fIsGameOverFinished, 1, sGame)) { sState = GAME_OVER; sRuns++; save_records(); }
     fe_time_engine_us = (uint32_t)(plat_time_us() - t0);
     plat_poll();
     CRUMB("clear");
     fe_frame_begin(sW, sH);
     if (!sDrawing) return;
     if (sWarm < TESTS * TEST_SPACING) {
-        /* Hardware test at start-up: the iPod rebooted about 25 ms after the first rectangle
-         * drawn with one of the sprite sheets. One texture of each kind is shown in turn, a
-         * dozen frames apart, so the trail says which kind the driver cannot take. */
-        /* Every texture is drawn with for the first time here, one every twelve frames in a
-         * frame that holds little else. The two reboots when a run began came on the frame
-         * that first used the score display's sheet and the digits; the first scene frame
-         * rebooted whenever it was also the first use of the screens' sheet, and never when
-         * that sheet had been shown in one of these squares first. */
-        int test = sWarm / TEST_SPACING;
-        if (sWarm % TEST_SPACING == 0) { plat_log("first use %d", test); plat_log_flush(); port_test_mark(test); }
-        for (int t = 0; t <= test; t++)
-            if (sTest[t]) fe_overlay(sTest[t], 8.0f + 44.0f * (float)(t % 5), 8.0f + 44.0f * (float)(t / 5), 40.0f, 40.0f, 0.3f, 0.3f, 0.7f, 0.7f, WHITE);
+        /* The loading screen. The driver takes a texture's first draw badly when the frame
+         * holds much else: with the larger sheets of earlier builds the first scene frame
+         * rebooted the iPod whenever it was also the first use of two of them. So each texture
+         * is first drawn here, alone, as a dot in the bottom corner, a few frames apart; the
+         * screens' sheet goes first and the logo is up from then on. */
+        int step = sWarm / TEST_SPACING;
+        if (sWarm % TEST_SPACING == 0) port_test_mark(step);
+        if (sTest[step]) fe_overlay(sTest[step], 2.0f + 4.0f * (float)step, (float)sH - 5.0f, 3.0f, 3.0f, 0.4f, 0.4f, 0.6f, 0.6f, WHITE);
+        if (step >= 1) picture("logo", 0.0f, 12.0f * (float)sW / 320.0f, (float)sW, WHITE);
         sWarm++;
         fe_frame_end();
         return;
