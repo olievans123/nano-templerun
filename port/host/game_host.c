@@ -46,6 +46,7 @@ int plat_write_file(const char *name, const void *data, uint32_t size) {
     return 0;
 }
 void plat_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); fputc('\n', stderr); }
+void plat_poll(void) {}
 void plat_fatal(const char *message) { fprintf(stderr, "fatal: %s\n", message); exit(2); }
 void rt_host_sound(const char *name, int loop, float pitch, int stop) {
     if (getenv("TR_SOUNDS")) fprintf(stderr, "sound %s%s pitch %.2f%s\n", stop ? "stop " : "", name, (double)pitch, loop ? " (loop)" : "");

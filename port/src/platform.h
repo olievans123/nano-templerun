@@ -6,6 +6,9 @@ uint64_t plat_time_us(void);
 void *plat_read_file(const char *name, uint32_t *size, int save);
 int plat_write_file(const char *name, const void *data, uint32_t size);
 void plat_log(const char *fmt, ...);
+/* Called many times during a frame, so the platform can note the finger's state more often
+ * than once a frame (a quick tap can begin and end within one slow frame). */
+void plat_poll(void);
 /* Stop the game with a message; does not return. */
 void plat_fatal(const char *message);
 #endif

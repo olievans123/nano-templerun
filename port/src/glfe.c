@@ -522,6 +522,7 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
 }
 
 static void draw(int count, const uint16_t *idx, int first) {
+    plat_poll();
     uint64_t t0 = plat_time_us();
     draw_triangles(count, idx, first);
     fe_time_transform_us += (unsigned)(plat_time_us() - t0);
@@ -590,6 +591,7 @@ void fe_frame_begin(int panel_w, int panel_h) {
 }
 
 static void draw_batch(const Batch *b, int index) {
+    plat_poll();
     CRUMB("batch", (uint32_t)(index << 16) | (uint32_t)(b->tex1 ? 2 : 1) | (uint32_t)b->kind << 8);
     glActiveTexture(GL_TEXTURE1);
     glClientActiveTexture(GL_TEXTURE1);

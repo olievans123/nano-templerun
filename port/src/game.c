@@ -105,7 +105,8 @@ void game_touch(int phase, float x, float y) {
 }
 
 void game_tilt(float x) { sTilt = x; }
-static int sDrawing = 1;
+static int sDrawing = 1, sWarm;
+unsigned rt_texture_host(uint32_t id);
 void game_set_drawing(int on) { sDrawing = on; }
 
 /* ---- autopilot: plays through the same touch calls a finger makes ---------------------------- */
@@ -283,9 +284,21 @@ void game_frame(float dt) {
     rt_invoke(fSimulate, 2, sGame, rt_fbits(dt));
     if (sState == GAME_RUNNING && rt_invoke(fIsGameOverFinished, 1, sGame)) { sState = GAME_OVER; sRuns++; }
     fe_time_engine_us = (uint32_t)(plat_time_us() - t0);
+    plat_poll();
     CRUMB("clear");
     fe_frame_begin(sW, sH);
     if (!sDrawing) return;
+    if (sWarm < 16) {
+        /* Once in a while the first frame drawn after loading rebooted the iPod. Its driver
+         * prepares a texture the first time it is drawn with, so the textures are introduced
+         * one a frame, each with one small clear rectangle, before the scene uses them all. */
+        unsigned texture = sWarm == 0 ? sUiTexture : rt_texture_host((uint32_t)sWarm);
+        if (texture) fe_overlay(texture, 8.0f, 8.0f, 16.0f, 16.0f, 0.25f, 0.25f, 0.75f, 0.75f, 0u);
+        sWarm++;
+        CRUMB("warm");
+        fe_frame_end();
+        return;
+    }
     CRUMB("draw");
     t0 = plat_time_us();
     rt_invoke(fDraw, 1, sGame);

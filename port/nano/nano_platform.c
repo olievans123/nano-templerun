@@ -220,7 +220,8 @@ unsigned rt_host_load_texture(const char *name,const char *file,int repeat) {
                 if(lw==1&&lh==1){level++;break;}
                 lw=lw>1?lw/2:1;lh=lh>1?lh/2:1;
             }
-            if(level>mips)glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_NEAREST);
+            /* smaller levels only if the file has them all (a lone level with a mipmap filter draws white) */
+            if(mips>0 && level>mips)glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_NEAREST);
             ok=sent>=1;texture_bytes+=used;
         }
     }
@@ -229,6 +230,27 @@ unsigned rt_host_load_texture(const char *name,const char *file,int repeat) {
     return t;
 }
 void rt_host_sound(const char *name,int loop,float pitch,int stop){(void)name;(void)loop;(void)pitch;(void)stop;}
+
+/* ---- touch ---- */
+/* The resident keeps only the finger's latest state, and a frame here can take 40 ms: a
+ * quick tap would come and go between two looks. So the state is sampled all through the
+ * frame (plat_poll) and the changes are queued for the game. */
+#define TOUCH_QUEUE 24
+static struct { int16_t x,y;uint8_t down; } touch_queue[TOUCH_QUEUE];
+static int touch_count,touch_last_down;static int16_t touch_last_x,touch_last_y;
+static uint32_t touch_presses;
+void plat_poll(void) {
+    hb_spoint_t f;hb_surface_touch_read(&f);
+    int down=f.down!=0;
+    if(down==touch_last_down && (!down || (f.x==touch_last_x && f.y==touch_last_y)))return;
+    if(down && !touch_last_down)touch_presses++;
+    touch_last_down=down;touch_last_x=f.x;touch_last_y=f.y;
+    if(touch_count<TOUCH_QUEUE) {
+        touch_queue[touch_count].x=f.x;touch_queue[touch_count].y=f.y;touch_queue[touch_count].down=(uint8_t)down;touch_count++;
+    } else if(!down) {                                   /* never lose a release */
+        touch_queue[TOUCH_QUEUE-1].x=f.x;touch_queue[TOUCH_QUEUE-1].y=f.y;touch_queue[TOUCH_QUEUE-1].down=0;
+    }
+}
 
 /* ---- frames ---- */
 /* The engine advances by the time that has really passed (as on the phone), so the frame
@@ -286,9 +308,12 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     }
     last=now;
 
-    hb_spoint_t finger;hb_surface_touch_read(&finger);
-    if(finger.down){game_touch(touching?1:0,(float)finger.x,(float)finger.y);touching=1;}
-    else if(touching){game_touch(2,(float)finger.x,(float)finger.y);touching=0;}
+    plat_poll();
+    for(int i=0;i<touch_count;i++) {
+        if(touch_queue[i].down){game_touch(touching?1:0,(float)touch_queue[i].x,(float)touch_queue[i].y);touching=1;}
+        else if(touching){game_touch(2,(float)touch_queue[i].x,(float)touch_queue[i].y);touching=0;}
+    }
+    touch_count=0;
     port_crumb("input",count,0);
     int32_t g[3]={0,0,0};hb_accel_read_milli_g(g);
     float tilt=(float)-g[0]*0.001f;                     /* the phone reports gravity; the nano the opposite */
@@ -298,7 +323,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
      * same frame a few seconds later never has. So the first frames after the textures go
      * up only clear the screen, and the next ones draw without the fog blending. */
     game_set_drawing(count>=4);
-    fe_option_fog_blend=count>=24;
+    fe_option_fog_blend=count>=44;
     port_crumb("heap",hb_os_heap_free(),0);
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();
@@ -327,11 +352,13 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     if(reports<8 && seconds>=marks[reports] && perf.frames) {
         reports++;
         uint32_t fps10=perf.period?(uint32_t)((uint64_t)perf.frames*10000000u/perf.period):0;
-        plat_log("%u s: %u frames, %u.%u fps, work %u us = simulate %u + draw %u (of which transform %u) + submit %u (first call %u) + clear %u; max work %u, max period %u, over 40 ms %u; per frame %u vertices in, %u triangles out, %u draws; dropped %u; state %d, distance %d; heap free %u, engine heap %u",
+        plat_log("%u s: %u frames, %u.%u fps, work %u us = simulate %u + draw %u (transform %u) + submit %u (first call %u); max work %u, max period %u, over 40 ms %u",
                  (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),
-                 (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),(unsigned)(perf.first/perf.frames),(unsigned)(perf.clear/perf.frames),perf.max_work,
-                 perf.max_period,perf.over40,perf.vertices/perf.frames,perf.triangles/perf.frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
-                 hb_os_heap_free(),(unsigned)rt_heap_peak());
+                 (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),
+                 (unsigned)(perf.first/perf.frames),perf.max_work,perf.max_period,perf.over40);
+        plat_log("  per frame %u vertices in, %u triangles out, %u draws; dropped %u; state %d, distance %d, presses %u; heap free %u, engine heap %u",
+                 perf.vertices/perf.frames,perf.triangles/perf.frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
+                 (unsigned)touch_presses,hb_os_heap_free(),(unsigned)rt_heap_peak());
         flush_log();
         memset(&perf,0,sizeof perf);
         last=0;

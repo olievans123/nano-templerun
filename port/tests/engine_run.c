@@ -35,6 +35,7 @@ void *plat_read_file(const char *name, uint32_t *size, int save) {
 }
 int plat_write_file(const char *name, const void *data, uint32_t size) { (void)name; (void)data; (void)size; return 0; }
 void plat_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); fputc('\n', stderr); }
+void plat_poll(void) {}
 void plat_fatal(const char *message) { fprintf(stderr, "fatal: %s\n", message); exit(2); }
 unsigned rt_host_load_texture(const char *name, const char *file, int repeat) { (void)name; (void)file; (void)repeat; return 1; }
 void rt_host_sound(const char *name, int loop, float pitch, int stop) { (void)name; (void)loop; (void)pitch; (void)stop; }
