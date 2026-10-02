@@ -150,6 +150,8 @@ static void flush_log(void) {
     if(mark){memset(mark,0,4096);memcpy(mark,"log written\n",12);hb_fs_write(DATA_DIR "/sync.txt",mark,12);free(mark);}
 }
 
+void plat_log_flush(void) { flush_log(); }
+
 /* Fatal errors unwind to the frame driver, which stops the game; spinning would freeze the
  * iPod's UI task. */
 static jmp_buf fatal_jump;
@@ -323,7 +325,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
      * same frame a few seconds later never has. So the first frames after the textures go
      * up only clear the screen, and the next ones draw without the fog blending. */
     game_set_drawing(count>=4);
-    fe_option_fog_blend=count>=44;
+    fe_option_fog_blend=count>=90;
     port_crumb("heap",hb_os_heap_free(),0);
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();

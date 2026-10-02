@@ -16,6 +16,7 @@
 
 unsigned rt_host_load_texture(const char *name, const char *file, int repeat);
 static void load_screens(void);
+unsigned rt_texture_host(uint32_t id);
 
 #ifdef AB_NANO
 extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail that survives a reboot */
@@ -25,6 +26,14 @@ extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail 
 #endif
 
 unsigned fe_time_draw_us;       /* the last frame's time in the engine's draw(), including the port's transform */
+#define TESTS 5
+#define TEST_SPACING 12
+static unsigned sTest[TESTS];
+#ifdef AB_NANO
+static void port_test_mark(int test) { port_crumb("test", (uint32_t)test, 0); }
+#else
+static void port_test_mark(int test) { (void)test; }
+#endif
 static uint32_t sGame, sScratch;
 static uint32_t fSimulate, fDraw, fStart, fRestart, fTouchBegan, fTouchMoved, fTouchEnded, fTilt, fIsGameOver,
                 fIsGameOverFinished, fGetScore, fGetCoins, fGetDistance, fIsPaused, fUnpause;
@@ -201,6 +210,11 @@ static void load_screens(void) {
     }
     free(text);
     sUiTexture = rt_host_load_texture("uiSheet", "uiSheet.png", 0);
+    sTest[0] = rt_texture_host(10);     /* wallTexture: the kind the test scene proved */
+    sTest[3] = rt_texture_host(5);      /* fontCountdownTexture */
+    sTest[4] = sUiTexture;
+    sTest[1] = rt_host_load_texture("testMip256", "testMip256.png", 0);
+    sTest[2] = rt_host_load_texture("testMip1024", "testMip1024.png", 0);
 }
 
 static const Sprite *sprite(const char *name) {
@@ -288,14 +302,16 @@ void game_frame(float dt) {
     CRUMB("clear");
     fe_frame_begin(sW, sH);
     if (!sDrawing) return;
-    if (sWarm < 16) {
-        /* Once in a while the first frame drawn after loading rebooted the iPod. Its driver
-         * prepares a texture the first time it is drawn with, so the textures are introduced
-         * one a frame, each with one small clear rectangle, before the scene uses them all. */
-        unsigned texture = sWarm == 0 ? sUiTexture : rt_texture_host((uint32_t)sWarm);
-        if (texture) fe_overlay(texture, 8.0f, 8.0f, 16.0f, 16.0f, 0.25f, 0.25f, 0.75f, 0.75f, 0u);
+    if (sWarm < TESTS * TEST_SPACING) {
+        /* Hardware test at start-up: the iPod rebooted about 25 ms after the first rectangle
+         * drawn with one of the sprite sheets. One texture of each kind is shown in turn, a
+         * dozen frames apart, so the trail says which kind the driver cannot take. */
+        static const char *const kind[TESTS] = { "wall RGB levels", "256 RGBA levels", "1024 RGBA levels", "256 RGBA single", "1024 RGBA single" };
+        int test = sWarm / TEST_SPACING;
+        if (sWarm % TEST_SPACING == 0) { plat_log("test %d: %s", test, kind[test]); plat_log_flush(); port_test_mark(test); }
+        for (int t = 0; t <= test; t++)
+            if (sTest[t]) fe_overlay(sTest[t], 8.0f + 44.0f * (float)t, 8.0f, 40.0f, 40.0f, 0.3f, 0.3f, 0.7f, 0.7f, WHITE);
         sWarm++;
-        CRUMB("warm");
         fe_frame_end();
         return;
     }
