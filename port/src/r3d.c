@@ -52,6 +52,8 @@ static OutVtx sPool[CHUNKS * CHUNK_VERTS];
 static int sMode = R3D_VBO;
 static float sProjection[16], sView[16];
 void r3d_set_mode(int mode) { sMode = mode; }
+static float sMinArea2 = 0.25f, sInset = 0.9990234375f;
+void r3d_set_guard(float min_area2, float inset) { sMinArea2 = min_area2; sInset = inset; }
 static int sChunksUsed;
 static GLuint sVbo;
 int r3d_stat_dropped;
@@ -88,7 +90,8 @@ void r3d_begin(int panel_w, int panel_h, const float projection[16], const float
     sChunksUsed = 0;
 }
 
-static void draw_batch(const Batch *b) {
+static void draw_batch(const Batch *b, int index) {
+    CRUMB("batch", (uint32_t)(index << 16) | (uint32_t)(b->tex1 ? 2 : 1));
     glActiveTexture(GL_TEXTURE1);
     glClientActiveTexture(GL_TEXTURE1);
     if (b->tex1) {
@@ -100,19 +103,23 @@ static void draw_batch(const Batch *b) {
         glDisable(GL_TEXTURE_2D);
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     }
+    CRUMB("unit1", b->tex1);
     glActiveTexture(GL_TEXTURE0);
     glClientActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, b->tex0);
+    CRUMB("unit0", b->tex0);
     for (int k = 0; k < b->chunks; k++) {
         int n = k + 1 == b->chunks ? b->last : CHUNK_VERTS;
         if (!n) continue;
         int step = (sMode & R3D_SMALL) ? 384 : CHUNK_VERTS;
+        if ((sMode & R3D_EACH) && index == 1) step = 3;      /* one triangle a call, to find a bad one */
         for (int first = 0; first < n; first += step) {
             int count = n - first < step ? n - first : step;
-            CRUMB("arrays", (uint32_t)(b->chunk[k] << 16) | (uint32_t)count);
+            CRUMB("arrays", (uint32_t)(b->chunk[k] << 16) | (uint32_t)(step == 3 ? first : count));
             glDrawArrays(GL_TRIANGLES, b->chunk[k] * CHUNK_VERTS + first, count);
             r3d_stat_draws++;
         }
+        CRUMB("drew", (uint32_t)(b->chunk[k] << 16) | (uint32_t)n);
         r3d_stat_triangles_out += n / 3;
     }
 }
@@ -151,7 +158,7 @@ static void emit(Batch *bt, const Vtx *a, const Vtx *b, const Vtx *c,
     float area2 = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);       /* pixels, y up */
     if (cull && area2 >= 0.f) return;                                   /* front faces are clockwise */
     if (area2 < 0.f) area2 = -area2;
-    if (!(area2 >= 0.25f)) { r3d_stat_tiny++; return; }                 /* also rejects NaN */
+    if (!(area2 >= sMinArea2)) { r3d_stat_tiny++; return; }             /* also rejects NaN */
     OutVtx *v = reserve(bt);
     if (!v) return;
     const Vtx *in[3] = { a, b, c };
@@ -167,17 +174,17 @@ static void emit(Batch *bt, const Vtx *a, const Vtx *b, const Vtx *c,
 /* Signed distance to clip plane `bit` (>= 0 is inside). */
 static float plane(const Vtx *v, int bit) {
     switch (bit) {
-    case 0: return v->x + v->w * INSET;
-    case 1: return v->w * INSET - v->x;
-    case 2: return v->y + v->w * INSET;
-    case 3: return v->w * INSET - v->y;
+    case 0: return v->x + v->w * sInset;
+    case 1: return v->w * sInset - v->x;
+    case 2: return v->y + v->w * sInset;
+    case 3: return v->w * sInset - v->y;
     case 4: return v->w - sNearW;
     default: return sFarW - v->w;
     }
 }
 
 static unsigned char outcode(const Vtx *v) {
-    float e = v->w * INSET;
+    float e = v->w * sInset;
     unsigned char code = 0;
     if (v->x < -e) code |= 1;
     if (v->x > e) code |= 2;
@@ -335,8 +342,11 @@ void r3d_end(void) {
     glEnable(GL_TEXTURE_2D);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glTexCoordPointer(2, GL_FLOAT, sizeof(OutVtx), base + offsetof(OutVtx, u0));
-    for (int i = 0; i < BATCHES; i++)
-        if (sBatch[i].used) draw_batch(&sBatch[i]);
+    for (int i = 0; i < BATCHES; i++) {
+        int k = (sMode & R3D_REVERSE) ? BATCHES - 1 - i : i;
+        if (sBatch[k].used) draw_batch(&sBatch[k], k);
+    }
+    CRUMB("drawn-all", 0);
     glActiveTexture(GL_TEXTURE1);
     glClientActiveTexture(GL_TEXTURE1);
     glDisable(GL_TEXTURE_2D);

@@ -135,13 +135,15 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
  * which ones the nano's driver accepts. The trial number is stored before anything is
  * drawn; a trial that lives six seconds leaves its numbers in trial-N.txt, and the crash
  * trail of the launch before is saved as prev-N.txt. */
-#define TRIALS 5
-static const struct { const char *name;int indexed,mode; } trials[TRIALS]={
-    {"world positions, GL matrices, buffer object",0,R3D_WORLD|R3D_VBO},
-    {"world positions, GL matrices, client arrays",0,R3D_WORLD},
-    {"clip positions, client arrays, small draws, colour array",0,R3D_SMALL|R3D_COLOR},
-    {"clip positions, buffer object",0,R3D_VBO},
-    {"indexed meshes straight through GL (first test)",1,0},
+#define TRIALS 6
+#define BASE (R3D_SMALL|R3D_COLOR)      /* clip positions, client arrays, small draws, colour array */
+static const struct { const char *name;int mode,no_trees,no_light;float min_area2,inset; } trials[TRIALS]={
+    {"as before (clip positions, client arrays), finer trail",BASE,0,0,0.25f,0.9990234375f},
+    {"batches drawn last to first",BASE|R3D_REVERSE,0,0,0.25f,0.9990234375f},
+    {"no trees",BASE,1,0,0.25f,0.9990234375f},
+    {"no lightmap",BASE,0,1,0.25f,0.9990234375f},
+    {"tree batch one triangle per call",BASE|R3D_EACH,0,0,0.25f,0.9990234375f},
+    {"nothing under 2 square pixels, clip 1% inside",BASE,0,0,4.0f,0.99f},
 };
 static int trial;
 
@@ -169,7 +171,8 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
             char prev[16];snprintf(prev,sizeof prev,"prev-%d.txt",(trial+TRIALS-1)%TRIALS);
             save_previous_crumbs(prev);
             plat_write_file("trial.bin",&next,1);
-            scene_indexed=trials[trial].indexed;r3d_set_mode(trials[trial].mode);
+            scene_no_trees=trials[trial].no_trees;r3d_set_mode(trials[trial].mode);
+            r3d_set_guard(trials[trial].min_area2,trials[trial].inset);
             plat_log("trial %d: %s",trial,trials[trial].name);
         }
         port_crumb("trial",(uint32_t)trial,0);
@@ -222,6 +225,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         if(index>=PHASES){reported=1;index=0;}
         mode=phase_mode[index];
     }
+    if(trials[trial].no_light)mode=1;
     last=plat_time_us();now=last;        /* a log write above must not count as a frame */
     float dt=period?(float)period*1e-6f:1.f/30.f;
     if(dt>0.1f)dt=0.1f;

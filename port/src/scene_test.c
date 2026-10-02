@@ -52,6 +52,7 @@ int scene_init(void) {
     return sWall && sPlayerTex ? 0 : -1;
 }
 
+int scene_no_trees;       /* test switch: leave the trees out */
 int scene_indexed;       /* 1: the first test's path (GL transforms and clips indexed meshes), as a control */
 
 static void draw_indexed(const TRMesh *m, int frame, unsigned base, unsigned light, const float model[16]) {
@@ -137,7 +138,7 @@ void scene_frame(int w, int h, float dt, int mode) {
     for (int i = first; i < first + 8; i++) {
         const TRMesh *m = (i % 5) == 4 ? sTower : sStraight[(unsigned)i % 3u];
         draw(m, 0, sWall, mode == 0 ? sLight : 0, 0, 0, -60.f * (float)i, 1.f);
-        if (i & 1) {
+        if ((i & 1) && !scene_no_trees) {
             draw(sTree[(unsigned)(i >> 1) & 1u], 0, sTreeTex, mode == 0 ? sLight : 0, (i & 2) ? -45.f : 45.f, 0, -60.f * (float)i, 1.f);
         }
     }
