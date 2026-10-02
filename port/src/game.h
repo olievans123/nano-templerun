@@ -14,6 +14,8 @@ void game_tilt(float x);
 
 /* With drawing off a frame only clears the screen (the engine still advances). */
 void game_set_drawing(int on);
+/* Until the scene is ready a frame shows a loading screen (the logo) instead of the game. */
+void game_set_scene_ready(int ready);
 /* Let the shell play by itself (for soak tests and demonstrations). */
 void game_autopilot(int on);
 

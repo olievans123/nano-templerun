@@ -119,6 +119,9 @@ void game_tilt(float x) { sTilt = x; }
 static int sDrawing = 1, sWarm;
 unsigned rt_texture_host(uint32_t id);
 void game_set_drawing(int on) { sDrawing = on; }
+static int sSceneReady = 1;
+void game_set_scene_ready(int ready) { sSceneReady = ready; }
+static float picture(const char *name, float x, float y, float width, uint32_t colour);
 
 /* ---- autopilot: plays through the same touch calls a finger makes ---------------------------- */
 #define PLAYER_OFFSET 0x198
@@ -301,12 +304,13 @@ void game_frame(float dt) {
     CRUMB("clear");
     fe_frame_begin(sW, sH);
     if (!sDrawing) return;
-    if (sWarm < 2) {
-        /* The first thing drawn: a few pixels with a wall texture. (On two launches whose
-         * first draw was a rectangle of the screens' sheet, the iPod rebooted a frame later;
-         * a launch that began with a wall texture went on to draw every kind without trouble.) */
+    if (!sSceneReady) {
+        /* A loading screen: a few pixels of a wall texture, then the logo. The platform says
+         * when the scene may be drawn (see nano_platform.c: drawing it too soon after the
+         * textures go up rebooted the iPod). */
         if (sTest[0]) fe_overlay(sTest[0], 2.0f, 2.0f, 6.0f, 6.0f, 0.4f, 0.4f, 0.6f, 0.6f, WHITE);
-        sWarm++;
+        if (++sWarm > 12) picture("logo", 0.0f, 12.0f * (float)sW / 320.0f, (float)sW, WHITE);
+        CRUMB("wait");
         fe_frame_end();
         return;
     }
