@@ -286,7 +286,7 @@ static struct { uint32_t frames,max_period,max_work,over40,triangles,draws,dropp
 extern unsigned fe_time_draw_us;
 
 void tr_nano_frame(int w,int h,uint32_t frame) {
-    static uint64_t last,previous_end,started;static uint32_t previous_frame,count;static int reports,touching;
+    static uint64_t last,previous_end,started;static uint32_t previous_frame,count;static int reports,touching,waiting;
     if(w<1||h<1||failed)return;
     fatal_armed=1;
     if(setjmp(fatal_jump)){fatal_armed=0;return;}
@@ -354,17 +354,22 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
      * up only clear the screen, and the next ones draw without the fog blending. */
     game_set_drawing(count>=4);
     {
-        /* After loading, the OS heap keeps growing for a second or two (about 0.6 MB: the
-         * driver letting go of the texture uploads, it seems), and a full scene drawn during
-         * that time rebooted the iPod on most launches, while scenes first drawn two or three
-         * seconds in never have. So nothing at all is drawn for the first four seconds, and
-         * then not until the heap has stopped growing. */
+        /* After loading, the scene waits. Drawn within a few frames of the textures going
+         * up, it rebooted the iPod on most launches; so did a four-second wait that spun the
+         * processor between frames. The two builds that never failed here wrote the log to
+         * disk five times in their first two seconds, and a file write is one of the few
+         * things that makes this task give up the processor (the SDK notes that a busy UI
+         * task starves the OS's other threads). So the wait does that: no spinning, a log
+         * write every twelve frames, and then until the OS heap has stopped growing (it gains
+         * about 0.6 MB as whatever was waiting gets its turn). */
         static uint32_t highest,steady,ready_at;
         uint32_t free_now=hb_os_heap_free();
         if(free_now>highest+8192u){highest=free_now;steady=0;}else steady++;
-        if(!ready_at && ((count>=120 && steady>=45) || count>=400)) {
-            ready_at=count;port_crumb("ready-at",count,free_now);
+        if(!ready_at) {
+            if(count>=4 && count<64 && count%12u==4u){plat_log("waiting: frame %u, heap free %u",(unsigned)count,(unsigned)free_now);flush_log();last=0;}
+            if((count>=64 && steady>=12) || count>=400){ready_at=count;port_crumb("ready-at",count,free_now);}
         }
+        waiting=!ready_at;
         game_set_scene_ready(ready_at!=0);
         fe_option_fog_blend=ready_at && count>=ready_at+30;
     }
@@ -383,7 +388,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     perf.over40+=period>40000u;
     (void)t1;
 
-    if(tr_fast_redraw && work+gap_estimate<BEAT_US) {    /* hold the 30 Hz beat (a spin: the UI task has no sleep) */
+    if(tr_fast_redraw && !waiting && work+gap_estimate<BEAT_US) {    /* hold the 30 Hz beat (a spin: the UI task has no sleep) */
         static uint64_t slot;
         if(!slot || now>slot+BEAT_US || now+BEAT_US<slot)slot=now;
         slot+=BEAT_US;

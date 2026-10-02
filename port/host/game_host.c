@@ -162,6 +162,9 @@ int main(int argc, char **argv) {
             frames, (double)(plat_time_us() - t0) / 1e6, tris / frames, fogged / frames, draws / frames, clipped / frames,
             tiny / frames, dropped, fe_stat_outside, fe_stat_slivers, runs, best, game_state(), game_score(), game_coins(), game_distance(),
             (unsigned)rt_heap_peak(), (unsigned)rt_heap_used());
+    { extern float fe_ext_min_w, fe_ext_max_w, fe_ext_min_depth, fe_ext_max_depth, fe_ext_max_uv; extern int fe_stat_near;
+      fprintf(stderr, "extremes: w %.3f..%.1f, depth %.5f..%.5f, |uv| up to %.2f; near crossings in the last frame %d\n", (double)fe_ext_min_w,
+              (double)fe_ext_max_w, (double)fe_ext_min_depth, (double)fe_ext_max_depth, (double)fe_ext_max_uv, fe_stat_near); }
     fprintf(stderr, "peaks: %d vertices in one draw, %d chunks of 384 vertices and %d batches in one frame\n", fe_peak_vertices,
             fe_peak_chunks, fe_peak_batches);
     return 0;

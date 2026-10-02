@@ -235,6 +235,7 @@ static OutVtx sPool[CHUNKS * CHUNK_VERTS];
 static Batch sBatches[BATCHES];
 static int sBatchCount, sChunksUsed, sOrderedOpen = -1;
 static float sHalfW = 120.0f, sHalfH = 216.0f;
+float fe_ext_min_w = 1e30f, fe_ext_max_w, fe_ext_min_depth = 1e30f, fe_ext_max_depth = -1e30f, fe_ext_max_uv;   /* host: extremes given to GL */
 int fe_stat_near;           /* triangles this frame that crossed the near plane */
 int fe_stat_slivers;        /* host builds: triangles given to GL that fail the guard (must stay 0) */
 int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_triangles_out, fe_stat_tiny, fe_stat_clipped,
@@ -684,6 +685,16 @@ static void submit(void) {
                 const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
                 if (!(v->w > 0.f && v->x > -v->w && v->x < v->w && v->y > -v->w && v->y < v->w && v->z > -v->w && v->z < v->w))
                     fe_stat_outside++;
+            }
+            for (int j = 0; j < n; j++) {
+                const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
+                float d = v->z / v->w, au = v->u0 < 0 ? -v->u0 : v->u0, av = v->v0 < 0 ? -v->v0 : v->v0;
+                if (v->w < fe_ext_min_w) fe_ext_min_w = v->w;
+                if (v->w > fe_ext_max_w) fe_ext_max_w = v->w;
+                if (d < fe_ext_min_depth) fe_ext_min_depth = d;
+                if (d > fe_ext_max_depth) fe_ext_max_depth = d;
+                if (au > fe_ext_max_uv) fe_ext_max_uv = au;
+                if (av > fe_ext_max_uv) fe_ext_max_uv = av;
             }
             for (int j = 0; j + 2 < n; j += 3) {        /* and none may be a sliver */
                 const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
