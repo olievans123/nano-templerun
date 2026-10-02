@@ -112,13 +112,6 @@ pvr = pvrtc.encode_pvr(sheet, mipmaps=False)
 decoded = Image.frombytes('RGBA', (1024, 1024), texture2ddecoder.decode_pvrtc(pvr[52:], 1024, 1024, 0), 'raw', 'BGRA')
 (host / 'uiSheet.rgba').write_bytes(struct.pack('<II', 1024, 1024) + decoded.tobytes())
 
-# Two test textures for finding what the nano's driver accepts: sheets with their smaller
-# levels (the game's own sheets have one level).
-for name, source in (('testMip256', 'fontNumbers'), ('testMip1024', 'interfaceTexture')):
-    pvr = pvrtc.encode_pvr(read_png(APP / (source + '.png')), mipmaps=True)
-    (nano / (name + '.pvr')).write_bytes(pvr)
-    (host / (name + '.rgba')).write_bytes((host / (source + '.rgba')).read_bytes())
-
 for pattern in ('*.bksb', '*.atlas', '*.fnt', 'modelRegistry.lvl'):
     for f in sorted(APP.glob(pattern)):
         shutil.copyfile(f, nano / f.name)

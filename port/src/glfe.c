@@ -14,6 +14,7 @@
  * closer than the fog start are drawn opaque first, the fogged ones after them, then
  * everything the engine draws without fog (effects, the runner, the display) in its order. */
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "gl.h"
@@ -234,6 +235,7 @@ static OutVtx sPool[CHUNKS * CHUNK_VERTS];
 static Batch sBatches[BATCHES];
 static int sBatchCount, sChunksUsed, sOrderedOpen = -1;
 static float sHalfW = 120.0f, sHalfH = 216.0f;
+int fe_stat_slivers;        /* host builds: triangles given to GL that fail the guard (must stay 0) */
 int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_triangles_out, fe_stat_tiny, fe_stat_clipped,
     fe_stat_dropped, fe_stat_calls, fe_stat_fogged, fe_stat_outside;
 
@@ -320,6 +322,20 @@ static int clip_plane(const Vtx *in, int n, Vtx *out, int bit) {
         }
     }
     return count;
+}
+
+/* Whether the driver can be given this triangle (corners in pixels, twice its area). It
+ * reboots the iPod on triangles with no area, and it places corners on a grid finer than a
+ * pixel, so one thinner than that grid has none: clipping the score display's sprites at the
+ * screen edge left slivers a tenth of a pixel wide and a hundred long, and the first frame
+ * that drew them rebooted it. Kept: at least 2 square pixels, and at least half a pixel
+ * across at its thinnest. */
+static inline int drawable(float ax, float ay, float bx, float by, float cx, float cy, float area2, float min_area2) {
+    if (!(area2 >= min_area2)) return 0;                /* also rejects NaN */
+    float e0 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay), e1 = (cx - bx) * (cx - bx) + (cy - by) * (cy - by),
+          e2 = (ax - cx) * (ax - cx) + (ay - cy) * (ay - cy);
+    float longest = e0 > e1 ? (e0 > e2 ? e0 : e2) : (e1 > e2 ? e1 : e2);
+    return area2 * area2 >= 0.25f * longest;            /* thinnest width = area2 / longest edge >= 0.5 */
 }
 
 static inline uint32_t byte_of(float v) { return v >= 255.f ? 255u : v <= 0.f ? 0u : (uint32_t)(v + 0.5f); }
@@ -475,7 +491,7 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
             float area2 = (sSX[ib] - ax) * (sSY[ic] - ay) - (sSX[ic] - ax) * (sSY[ib] - ay);    /* pixels, y up */
             if (cull && area2 >= 0.f) continue;         /* front faces are clockwise */
             if (area2 < 0.f) area2 = -area2;
-            if (!(area2 >= min_area2)) { fe_stat_tiny++; continue; }    /* also rejects NaN */
+            if (!drawable(ax, ay, sSX[ib], sSY[ib], sSX[ic], sSY[ic], area2, min_area2)) { fe_stat_tiny++; continue; }
             Batch *bt = target(&s, fogged);
             OutVtx *v = bt ? reserve(bt) : NULL;
             if (!v) continue;
@@ -505,7 +521,7 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
             float area2 = (sx[j] - sx[0]) * (sy[j + 1] - sy[0]) - (sx[j + 1] - sx[0]) * (sy[j] - sy[0]);
             if (cull && area2 >= 0.f) continue;
             if (area2 < 0.f) area2 = -area2;
-            if (!(area2 >= min_area2)) { fe_stat_tiny++; continue; }
+            if (!drawable(sx[0], sy[0], sx[j], sy[j], sx[j + 1], sy[j + 1], area2, min_area2)) { fe_stat_tiny++; continue; }
             Batch *bt = target(&s, fogged);
             OutVtx *v = bt ? reserve(bt) : NULL;
             if (!v) continue;
@@ -641,6 +657,22 @@ void fe_frame_end(void) {
 static void submit(void) {
     if (!sChunksUsed) return;
 #ifndef AB_NANO
+    if (getenv("TR_DUMP_BATCHES"))
+        for (int i = 0; i < sBatchCount; i++) {
+            const Batch *bt = &sBatches[i];
+            fprintf(stderr, "batch %d kind %d tex %u/%u blend %d depth %d mask %d:", i, bt->kind, bt->tex0, bt->tex1, bt->blend, bt->depth_test, bt->depth_mask);
+            int total = 0;
+            for (int k = 0; k < bt->chunks; k++) total += k + 1 == bt->chunks ? bt->last : CHUNK_VERTS;
+            fprintf(stderr, " %d vertices\n", total);
+            if (bt->kind == ORDERED && !bt->depth_test)
+                for (int j = 0; j < bt->last && bt->chunks == 1; j += 3) {
+                    const OutVtx *v = &sPool[bt->chunk[0] * CHUNK_VERTS + j];
+                    fprintf(stderr, "   (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) z %.3f w %.2f uv (%.3f,%.3f) colour %08x\n", (v[0].x + 1) * sHalfW, (1 - v[0].y) * sHalfH,
+                            (v[1].x + 1) * sHalfW, (1 - v[1].y) * sHalfH, (v[2].x + 1) * sHalfW, (1 - v[2].y) * sHalfH, v[0].z, v[0].w, v[0].u0, v[0].v0, v[0].color);
+                }
+        }
+#endif
+#ifndef AB_NANO
     for (int i = 0; i < sBatchCount; i++) {             /* host check: nothing given to GL may touch a clip boundary */
         const Batch *bt = &sBatches[i];
         for (int k = 0; k < bt->chunks; k++) {
@@ -649,6 +681,14 @@ static void submit(void) {
                 const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
                 if (!(v->w > 0.f && v->x > -v->w && v->x < v->w && v->y > -v->w && v->y < v->w && v->z > -v->w && v->z < v->w))
                     fe_stat_outside++;
+            }
+            for (int j = 0; j + 2 < n; j += 3) {        /* and none may be a sliver */
+                const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
+                float x[3], y[3];
+                for (int c = 0; c < 3; c++) { x[c] = v[c].x / v[c].w * sHalfW; y[c] = v[c].y / v[c].w * sHalfH; }
+                float area2 = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
+                if (area2 < 0.f) area2 = -area2;
+                if (!drawable(x[0], y[0], x[1], y[1], x[2], y[2], area2 * 1.02f, 3.9f)) fe_stat_slivers++;
             }
         }
     }

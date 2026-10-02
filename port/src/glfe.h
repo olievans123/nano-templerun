@@ -56,5 +56,6 @@ extern unsigned fe_time_transform_us, fe_time_submit_us, fe_time_clear_us, fe_ti
 extern unsigned fe_time_engine_us;                  /* the last frame's time in the engine's simulate() */
 extern int fe_peak_vertices, fe_peak_chunks, fe_peak_batches;
 extern unsigned fe_buffer_bytes;                    /* memory held for the engine's buffer objects */
+extern int fe_stat_slivers;
 extern int fe_stat_outside;     /* host builds: vertices that reached GL on or outside a clip boundary (must stay 0) */
 #endif

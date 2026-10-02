@@ -55,6 +55,7 @@ void rt_host_sound(const char *name, int loop, float pitch, int stop) {
 
 unsigned rt_host_load_texture(const char *name, const char *file, int repeat) {
     char base[64], path[80];
+    if (getenv("TR_TEXLOG")) fprintf(stderr, "load texture %s from %s, repeat %d\n", name, file, repeat);
     uint32_t size = 0;
     snprintf(base, sizeof base, "%s", file);
     char *dot = strrchr(base, '.');
@@ -134,7 +135,12 @@ int main(int argc, char **argv) {
     uint64_t t0 = plat_time_us();
     for (int f = 0; f < frames; f++) {
 
-        game_frame(1.0f / 30.0f);
+        if (getenv("TR_TAP") && f == atoi(getenv("TR_TAP"))) game_touch(0, 120, 300);
+        if (getenv("TR_TAP") && f == atoi(getenv("TR_TAP")) + 3) game_touch(2, 120, 300);
+        if (getenv("TR_DUMP") && f == atoi(getenv("TR_DUMP"))) setenv("TR_DUMP_BATCHES", "1", 1); else unsetenv("TR_DUMP_BATCHES");
+        game_frame(getenv("TR_DT") ? (float)atof(getenv("TR_DT")) : 1.0f / 30.0f);
+        if (getenv("TR_TAP") && f >= atoi(getenv("TR_TAP")) - 1 && f <= atoi(getenv("TR_TAP")) + 4)
+            fprintf(stderr, "frame %d: state %d, %d triangles out, %d draws, score %d\n", f, game_state(), fe_stat_triangles_out, fe_stat_draws, game_score());
         glFinish();
         if (game_state() == GAME_OVER && last_state == GAME_RUNNING) {
             runs++;
@@ -151,9 +157,9 @@ int main(int argc, char **argv) {
         }
     }
     fprintf(stderr, "%d frames in %.2f s: per frame %ld triangles (%ld fogged), %ld draw calls, %ld clipped, %ld tiny, %ld dropped; "
-            "%d outside clip bounds; %d runs, best distance %d; state %d score %d coins %d distance %d; heap %u high, %u in use\n",
+            "%d outside clip bounds, %d slivers; %d runs, best distance %d; state %d score %d coins %d distance %d; heap %u high, %u in use\n",
             frames, (double)(plat_time_us() - t0) / 1e6, tris / frames, fogged / frames, draws / frames, clipped / frames,
-            tiny / frames, dropped, fe_stat_outside, runs, best, game_state(), game_score(), game_coins(), game_distance(),
+            tiny / frames, dropped, fe_stat_outside, fe_stat_slivers, runs, best, game_state(), game_score(), game_coins(), game_distance(),
             (unsigned)rt_heap_peak(), (unsigned)rt_heap_used());
     fprintf(stderr, "peaks: %d vertices in one draw, %d chunks of 384 vertices and %d batches in one frame\n", fe_peak_vertices,
             fe_peak_chunks, fe_peak_batches);
