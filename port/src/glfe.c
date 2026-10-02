@@ -44,7 +44,15 @@ unsigned rt_texture_host(uint32_t id);
 
 /* ---- state ------------------------------------------------------------------------------- */
 typedef struct { int enabled, size, stride; uint32_t type, pointer, buffer; } Array;
-typedef struct { const uint8_t *data; uint32_t size, guest; int owned; } Buffer;
+/* A buffer object. The models' vertex buffers (position and one or two texture coordinates,
+ * all floats) are kept packed as 16-bit integers with a scale each: half the memory, and the
+ * steps are far below a pixel and a texel. Everything else is kept as the engine gave it. */
+typedef struct {
+    const uint8_t *data;
+    uint32_t size;
+    uint8_t packed, channels, stride, packed_stride;    /* stride: of the engine's layout */
+    float pos_scale, uv_scale[2];
+} Buffer;
 #define BUFFERS 640
 static Buffer sBuffers[BUFFERS];
 static uint32_t sNames = 100, sArrayBuffer, sElementBuffer;
@@ -141,10 +149,53 @@ void fe_normal_pointer(uint32_t type, int stride, uint32_t pointer) { (void)type
 /* ---- buffer objects: kept here; the engine's own block is used when it can be held --------- */
 void fe_gen_buffers(uint32_t count, uint32_t *names) { for (uint32_t i = 0; i < count; i++) names[i] = ++sNames; }
 static Buffer *buffer(uint32_t name) { return name > 100 && name - 100 < BUFFERS ? &sBuffers[name - 100] : NULL; }
+static uint32_t sMesh;
+void fe_note_mesh(uint32_t mesh) { sMesh = mesh; }
+unsigned fe_buffer_bytes;               /* memory held by buffer objects */
 static void buffer_release(Buffer *b) {
-    if (b->owned) free((void *)b->data);
-    else if (b->guest) rt_unpin(b->guest);
+    if (b->data) { fe_buffer_bytes -= b->packed ? b->size / b->stride * b->packed_stride : b->size; free((void *)b->data); }
     memset(b, 0, sizeof *b);
+}
+
+static int16_t quantize(float v, float inverse) {
+    float q = v * inverse;
+    return (int16_t)(q >= 0.f ? q + 0.5f : q - 0.5f);
+}
+
+/* Pack a model's vertices if its layout is the plain one: position first, then one or two
+ * pairs of texture coordinates, nothing else. */
+static int pack_vertices(Buffer *b, const uint8_t *data, uint32_t size) {
+    uint32_t mesh = sMesh;
+    if (!mesh || M8(mesh + 8) || M8(mesh + 9)) return 0;            /* normals or colours */
+    uint32_t stride = M32(mesh + 0x5c), channels = M32(mesh + 0xc), offsets = M32(mesh + 0x6c);
+    if (M32(mesh + 0x60) != 0 || channels < 1 || channels > 2 || stride != 12 + 8 * channels || !offsets || size % stride) return 0;
+    for (uint32_t c = 0; c < channels; c++) if (M32(offsets + 4 * c) != 12 + 8 * c) return 0;
+    uint32_t count = size / stride, packed_stride = 6 + 4 * channels;
+    float pos_max = 0.f, uv_max[2] = { 0.f, 0.f };
+    for (uint32_t i = 0; i < count; i++) {
+        float v[7];
+        memcpy(v, data + (size_t)i * stride, stride);
+        for (int k = 0; k < 3; k++) { float a = v[k] < 0.f ? -v[k] : v[k]; if (a > pos_max) pos_max = a; }
+        for (uint32_t c = 0; c < channels; c++)
+            for (int k = 0; k < 2; k++) { float a = v[3 + 2 * c + k]; if (a < 0.f) a = -a; if (a > uv_max[c]) uv_max[c] = a; }
+    }
+    if (!(pos_max < 1e6f) || !(uv_max[0] < 1e4f) || !(uv_max[1] < 1e4f)) return 0;     /* also rejects NaN */
+    int16_t *out = malloc((size_t)count * packed_stride);
+    if (!out) return 0;
+    b->pos_scale = pos_max > 0.f ? pos_max / 32767.f : 1.f;
+    for (uint32_t c = 0; c < 2; c++) b->uv_scale[c] = uv_max[c] > 0.f ? uv_max[c] / 32767.f : 1.f;
+    float ip = 1.f / b->pos_scale, iu[2] = { 1.f / b->uv_scale[0], 1.f / b->uv_scale[1] };
+    int16_t *o = out;
+    for (uint32_t i = 0; i < count; i++) {
+        float v[7];
+        memcpy(v, data + (size_t)i * stride, stride);
+        *o++ = quantize(v[0], ip); *o++ = quantize(v[1], ip); *o++ = quantize(v[2], ip);
+        for (uint32_t c = 0; c < channels; c++) { *o++ = quantize(v[3 + 2 * c], iu[c]); *o++ = quantize(v[4 + 2 * c], iu[c]); }
+    }
+    b->data = (const uint8_t *)out;
+    b->packed = 1; b->channels = (uint8_t)channels; b->stride = (uint8_t)stride; b->packed_stride = (uint8_t)packed_stride;
+    fe_buffer_bytes += count * packed_stride;
+    return 1;
 }
 void fe_bind_buffer(uint32_t target, uint32_t name) {
     if (target == FE_ARRAY_BUFFER) sArrayBuffer = name; else if (target == FE_ELEMENT_BUFFER) sElementBuffer = name;
@@ -155,17 +206,12 @@ void fe_buffer_data(uint32_t target, uint32_t size, const void *data, uint32_t u
     if (!b) return;
     buffer_release(b);
     b->size = size;
-    uint32_t guest = data ? (uint32_t)((const uint8_t *)data - g_mem) : 0;
-    if (guest && rt_pin(guest, size)) {         /* the engine frees its copy next: keep that block instead */
-        b->data = data;
-        b->guest = guest;
-    } else {
-        uint8_t *copy = malloc(size ? size : 1);
-        if (!copy) { plat_fatal("no memory for a vertex buffer"); return; }
-        if (data) memcpy(copy, data, size); else memset(copy, 0, size);
-        b->data = copy;
-        b->owned = 1;
-    }
+    if (target == FE_ARRAY_BUFFER && data && pack_vertices(b, data, size)) return;
+    uint8_t *copy = malloc(size ? size : 1);
+    if (!copy) { plat_fatal("no memory for a vertex buffer"); return; }
+    if (data) memcpy(copy, data, size); else memset(copy, 0, size);
+    b->data = copy;
+    fe_buffer_bytes += size;
 }
 void fe_delete_buffers(uint32_t count, const uint32_t *names) {
     for (uint32_t i = 0; i < count; i++) { Buffer *b = buffer(names[i]); if (b) buffer_release(b); }
@@ -191,6 +237,8 @@ static float sHalfW = 120.0f, sHalfH = 216.0f;
 int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_triangles_out, fe_stat_tiny, fe_stat_clipped,
     fe_stat_dropped, fe_stat_calls, fe_stat_fogged, fe_stat_outside;
 
+unsigned fe_time_engine_us;
+int fe_peak_vertices, fe_peak_chunks, fe_peak_batches;   /* the most one draw call, one frame have needed */
 static Batch *batch_for(int kind, unsigned tex0, unsigned tex1, int blend, int depth_test, int depth_mask) {
     if (kind == ORDERED) {
         if (sOrderedOpen >= 0) {
@@ -212,6 +260,7 @@ static Batch *batch_for(int kind, unsigned tex0, unsigned tex1, int blend, int d
     b->last = CHUNK_VERTS;              /* forces a first chunk */
     if (kind == ORDERED) sOrderedOpen = sBatchCount;
     sBatchCount++;
+    if (sBatchCount > fe_peak_batches) fe_peak_batches = sBatchCount;
     return b;
 }
 
@@ -219,6 +268,7 @@ static OutVtx *reserve(Batch *b) {
     if (b->last + 3 > CHUNK_VERTS) {
         if (sChunksUsed == CHUNKS || b->chunks == BATCH_CHUNKS) { fe_stat_dropped++; return NULL; }
         b->chunk[b->chunks++] = (uint8_t)sChunksUsed++;
+        if (sChunksUsed > fe_peak_chunks) fe_peak_chunks = sChunksUsed;
         b->last = 0;
     }
     OutVtx *v = &sPool[b->chunk[b->chunks - 1] * CHUNK_VERTS + b->last];
@@ -228,7 +278,7 @@ static OutVtx *reserve(Batch *b) {
 
 /* ---- transform, clip, cull ----------------------------------------------------------------- */
 typedef struct { float x, y, z, w, u0, v0, u1, v1, r, g, b, a, fog; } Vtx;
-#define MAX_VERTS 4096
+#define MAX_VERTS 2560
 static Vtx sVtx[MAX_VERTS];
 static float sSX[MAX_VERTS], sSY[MAX_VERTS];
 static uint8_t sCode[MAX_VERTS];
@@ -315,26 +365,49 @@ static void emit(const DrawState *s, const Vtx *a, const Vtx *b, const Vtx *c,
 static const uint8_t *array_base(const Array *a) {
     if (a->buffer) {
         Buffer *b = buffer(a->buffer);
-        return b && b->data ? b->data + a->pointer : NULL;
+        return b && b->data && !b->packed ? b->data + a->pointer : NULL;
     }
     return a->pointer ? g_mem + a->pointer : NULL;
+}
+static Buffer *packed_buffer(const Array *a) {
+    Buffer *b = a->buffer ? buffer(a->buffer) : NULL;
+    return b && b->data && b->packed ? b : NULL;
 }
 
 static void draw(int count, const uint16_t *idx, int first) {
     fe_stat_calls++;
-    const uint8_t *pos = sVertexArray.enabled ? array_base(&sVertexArray) : NULL;
-    if (!pos || count < 3) return;
+    Buffer *packed = sVertexArray.enabled ? packed_buffer(&sVertexArray) : NULL;
+    const uint8_t *pos = sVertexArray.enabled && !packed ? array_base(&sVertexArray) : NULL;
+    if ((!pos && !packed) || count < 3) return;
     int n = 0;
     if (idx) { for (int i = 0; i < count; i++) if (idx[i] >= n) n = idx[i] + 1; }
     else n = first + count;
+    if (n > fe_peak_vertices) fe_peak_vertices = n;
     if (n > MAX_VERTS) { fe_stat_dropped++; return; }
+    if (packed && sVertexArray.pointer / packed->stride + (uint32_t)n > packed->size / packed->stride) return;
 
     DrawState s;
     s.tex0 = sTexEnabled[0] ? rt_texture_host(sTexBound[0]) : 0;
     const uint8_t *uv0 = s.tex0 && sTexCoordArray[0].enabled ? array_base(&sTexCoordArray[0]) : NULL;
     const uint8_t *uv1 = sTexEnabled[1] && sTexCoordArray[1].enabled ? array_base(&sTexCoordArray[1]) : NULL;
-    s.tex1 = uv1 ? rt_texture_host(sTexBound[1]) : 0;
-    if (!s.tex1) uv1 = NULL;
+    /* a packed buffer holds the texture coordinates too: which of its pairs each unit reads */
+    int pk0 = -1, pk1 = -1;
+    const int16_t *pk = NULL;
+    if (packed) {
+        uint32_t base = sVertexArray.pointer / packed->stride;
+        if (sVertexArray.pointer % packed->stride || (int)packed->stride != sVertexArray.stride) return;
+        pk = (const int16_t *)(const void *)packed->data + (size_t)base * (packed->packed_stride / 2);
+        for (int u = 0; u < 2; u++) {
+            const Array *t = &sTexCoordArray[u];
+            if (!t->enabled || t->buffer != sVertexArray.buffer || t->pointer < sVertexArray.pointer) continue;
+            uint32_t rel = t->pointer - sVertexArray.pointer;
+            if (rel == 12 || (rel == 20 && packed->channels > 1)) { if (u == 0) pk0 = rel == 12 ? 0 : 1; else pk1 = rel == 12 ? 0 : 1; }
+        }
+        if (!s.tex0) pk0 = -1;
+        if (!sTexEnabled[1]) pk1 = -1;
+    }
+    s.tex1 = (uv1 || pk1 >= 0) ? rt_texture_host(sTexBound[1]) : 0;
+    if (!s.tex1) { uv1 = NULL; pk1 = -1; }
     const uint8_t *col = sColorArray.enabled ? array_base(&sColorArray) : NULL;
     s.fogged_scene = sFog && !sBlend && sDepthTest && sDepthMask;
     s.cull = sCull;
@@ -351,18 +424,24 @@ static void draw(int count, const uint16_t *idx, int first) {
     int vs = sVertexArray.stride ? sVertexArray.stride : 12, cs = sColorArray.stride ? sColorArray.stride : 4;
     int t0s = sTexCoordArray[0].stride ? sTexCoordArray[0].stride : 8, t1s = sTexCoordArray[1].stride ? sTexCoordArray[1].stride : 8;
     uint8_t all = 0xff;
+    int pks = packed ? packed->packed_stride / 2 : 0;
     for (int i = idx ? 0 : first; i < n; i++) {
         float p[3];
-        memcpy(p, pos + (size_t)i * (size_t)vs, 12);
         Vtx *o = &sVtx[i];
+        if (packed) {
+            const int16_t *q = pk + (size_t)i * (size_t)pks;
+            p[0] = q[0] * packed->pos_scale; p[1] = q[1] * packed->pos_scale; p[2] = q[2] * packed->pos_scale;
+            if (pk0 >= 0) { o->u0 = q[3 + 2 * pk0] * packed->uv_scale[pk0] + tu0; o->v0 = q[4 + 2 * pk0] * packed->uv_scale[pk0] + tv0; }
+            if (pk1 >= 0) { o->u1 = q[3 + 2 * pk1] * packed->uv_scale[pk1] + tu1; o->v1 = q[4 + 2 * pk1] * packed->uv_scale[pk1] + tv1; }
+        } else memcpy(p, pos + (size_t)i * (size_t)vs, 12);
         o->x = mvp[0] * p[0] + mvp[4] * p[1] + mvp[8] * p[2] + mvp[12];
         o->y = mvp[1] * p[0] + mvp[5] * p[1] + mvp[9] * p[2] + mvp[13];
         o->z = mvp[2] * p[0] + mvp[6] * p[1] + mvp[10] * p[2] + mvp[14];
         o->w = mvp[3] * p[0] + mvp[7] * p[1] + mvp[11] * p[2] + mvp[15];
         if (uv0) { float t[2]; memcpy(t, uv0 + (size_t)i * (size_t)t0s, 8); o->u0 = t[0] + tu0; o->v0 = t[1] + tv0; }
-        else o->u0 = o->v0 = 0.f;
+        else if (pk0 < 0) o->u0 = o->v0 = 0.f;
         if (uv1) { float t[2]; memcpy(t, uv1 + (size_t)i * (size_t)t1s, 8); o->u1 = t[0] + tu1; o->v1 = t[1] + tv1; }
-        else o->u1 = o->v1 = 0.f;
+        else if (pk1 < 0) o->u1 = o->v1 = 0.f;
         if (col) {
             const uint8_t *c = col + (size_t)i * (size_t)cs;
             o->r = c[0] * (1.f / 255.f); o->g = c[1] * (1.f / 255.f); o->b = c[2] * (1.f / 255.f); o->a = c[3] * (1.f / 255.f);
@@ -434,9 +513,14 @@ void fe_frame_begin(int panel_w, int panel_h) {
     sOrderedOpen = -1;
     fe_stat_draws = fe_stat_vertices_in = fe_stat_triangles_in = fe_stat_triangles_out = fe_stat_tiny = 0;
     fe_stat_clipped = fe_stat_dropped = fe_stat_calls = fe_stat_fogged = 0;
+    glViewport(0, 0, panel_w, panel_h);
     glClearColor(sClear[0], sClear[1], sClear[2], sClear[3]);
+    glClearDepthf(1.f);
     glDepthMask(GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glShadeModel(GL_SMOOTH);
 }
 
 static void draw_batch(const Batch *b, int index) {

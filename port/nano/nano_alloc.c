@@ -27,7 +27,7 @@ extern void hb_os_free(void *p);
 #define PORT_ARENA_SIZE 0x80000u
 #endif
 #define PORT_ARENA_MIN 0x80000u
-#define GL_RESERVE     0x400000u
+#define GL_RESERVE     0x380000u
 #define BIN_COUNT 28
 #define NONE UINT32_MAX
 #define USED 1u

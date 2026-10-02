@@ -7,6 +7,7 @@ TR_DIR ?= $(HOME)/nano-tr/port
 include ../../sdk/hb_app.mk
 NEWLIB_FLAGS := -marm -march=armv5te+fp -mfloat-abi=softfp
 LDLIBS := $(TR_DIR)/build/nano/libtr_nano.a \
+          $(shell $(CC) $(NEWLIB_FLAGS) -print-file-name=libm.a) \
           $(shell $(CC) $(NEWLIB_FLAGS) -print-file-name=libc.a) $(LIBGCC) \
           -Wl,--wrap=memcpy,--wrap=memmove,--wrap=memset
 $(BUILD)/$(APP_NAME).reloc.elf: $(TR_DIR)/build/nano/libtr_nano.a

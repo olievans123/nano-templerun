@@ -40,7 +40,11 @@ void *plat_read_file(const char *name, uint32_t *size, int save) {
     }
     return NULL;
 }
-int plat_write_file(const char *name, const void *data, uint32_t size) { (void)name; (void)data; (void)size; return 0; }
+int plat_write_file(const char *name, const void *data, uint32_t size) {
+    (void)data;
+    if (getenv("TR_RUNS")) fprintf(stderr, "write %s: %u bytes\n", name, (unsigned)size);
+    return 0;
+}
 void plat_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); fputc('\n', stderr); }
 void plat_fatal(const char *message) { fprintf(stderr, "fatal: %s\n", message); exit(2); }
 void rt_host_sound(const char *name, int loop, float pitch, int stop) {
@@ -119,7 +123,8 @@ int main(int argc, char **argv) {
     glViewport(0, 0, W, H);
     glEnable(GL_DEPTH_TEST);
     if (!game_init(W, H, 8u << 20, argc > 5 ? (uint32_t)atoi(argv[5]) : 1u)) return 1;
-    fprintf(stderr, "loaded: guest heap %u bytes high water, %u in use\n", (unsigned)rt_heap_peak(), (unsigned)rt_heap_used());
+    fprintf(stderr, "loaded: guest heap %u bytes high water, %u in use; buffer objects %u bytes\n", (unsigned)rt_heap_peak(),
+            (unsigned)rt_heap_used(), fe_buffer_bytes);
     long tris = 0, tiny = 0, clipped = 0, dropped = 0, fogged = 0, draws = 0;
     int runs = 0, last_state = GAME_TITLE, best = 0;
     game_autopilot(1);
@@ -148,5 +153,7 @@ int main(int argc, char **argv) {
             frames, (double)(plat_time_us() - t0) / 1e6, tris / frames, fogged / frames, draws / frames, clipped / frames,
             tiny / frames, dropped, fe_stat_outside, runs, best, game_state(), game_score(), game_coins(), game_distance(),
             (unsigned)rt_heap_peak(), (unsigned)rt_heap_used());
+    fprintf(stderr, "peaks: %d vertices in one draw, %d chunks of 384 vertices and %d batches in one frame\n", fe_peak_vertices,
+            fe_peak_chunks, fe_peak_batches);
     return 0;
 }

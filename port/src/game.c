@@ -153,8 +153,10 @@ void game_frame(float dt) {
         MF(sScratch + 8) = sTilt; MF(sScratch + 12) = 0.0f; MF(sScratch + 16) = 0.0f;
         rt_invoke(fTilt, 2, sGame, sScratch + 8);
     }
+    uint64_t t0 = plat_time_us();
     rt_invoke(fSimulate, 2, sGame, rt_fbits(dt));
     if (sState == GAME_RUNNING && rt_invoke(fIsGameOverFinished, 1, sGame)) sState = GAME_OVER;
+    fe_time_engine_us = (uint32_t)(plat_time_us() - t0);
     fe_frame_begin(sW, sH);
     rt_invoke(fDraw, 1, sGame);
     fe_frame_end();

@@ -55,8 +55,11 @@ vm = run_original()
 a = vm.dump()
 print('original: %d frames in %.1f s, heap %d bytes, random() calls %d' % (frames, time.time() - t, vm.next - oracle.HEAP, vm.random.calls))
 dump = ROOT / 'build/dump_c.bin'
-subprocess.run([str(ROOT / 'build/engine_run'), str(ROOT / 'build/engine'), str(oracle.APP), str(frames), str(seed), str(dump)],
-               check=True)
+if '--dump' in sys.argv:            # a dump made elsewhere (the ARM build under an emulator)
+    dump = Path(sys.argv[sys.argv.index('--dump') + 1])
+else:
+    subprocess.run([str(ROOT / 'build/engine_run'), str(ROOT / 'build/engine'), str(oracle.APP), str(frames), str(seed), str(dump)],
+                   check=True)
 b = dump.read_bytes()
 regions = [(0xd9000, 0xea000 - 0xd9000), (oracle.EXTERN, oracle.LITERALS - oracle.EXTERN), (oracle.HEAP, None)]
 brk_a, brk_b = struct.unpack_from('<I', a)[0], struct.unpack_from('<I', b)[0]
@@ -72,6 +75,6 @@ for base, size in regions:
             diffs.append((base + off, struct.unpack_from('<I', a, pos + off)[0], struct.unpack_from('<I', b, pos + off)[0]))
     pos += size
 print('%d differing words' % len(diffs))
-for addr, x, y in diffs[:int(sys.argv[3]) if len(sys.argv) > 3 else 12]:
+for addr, x, y in diffs[:12]:
     print('  %x: original %08x, translated %08x' % (addr, x, y))
 sys.exit(1 if diffs or brk_a != brk_b else 0)

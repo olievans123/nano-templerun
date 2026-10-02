@@ -1,5 +1,4 @@
-/* NanoApps SDK adapter for the Temple Run hardware test: loads the original models and
- * textures, runs the test scene, and logs frame timings once. */
+/* NanoApps SDK adapter for Temple Run: files, textures, touch, tilt, timing and the log. */
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -8,10 +7,12 @@
 #include "hb_sdk.h"
 #include "hb_heap.h"
 #include "hb_surface_input.h"
+#include <setjmp.h>
+#include "gl.h"
 #include "../src/platform.h"
-#include "../src/scene_test.h"
-#include "../src/tex.h"
-#include "../src/r3d.h"
+#include "../src/game.h"
+#include "../src/glfe.h"
+#include "../src/rt.h"
 
 #define DATA_DIR "/Apps/Data/TempleRun"
 #define MAX_FILES 256
@@ -50,7 +51,7 @@ static int manifest(void) {
     free(text);return file_count?0:-1;
 }
 void *plat_read_file(const char *name,uint32_t *size,int save) {
-    char path[112];uint32_t expected=16;
+    char path[112];uint32_t expected=65536;
     if(strstr(name,"..")||name[0]=='/')return NULL;
     if(!save) {
         int i;for(i=0;i<file_count;i++)if(!strcmp(files[i].name,name))break;
@@ -131,104 +132,171 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
     if(manager)((event_fn)(0x084069d8u|1u))(manager,4);
 }
 
-/* Soak test of the configuration the trials settled on (r3d.c defaults). */
-#define TRIALS 1
-static const struct { const char *name; } trials[TRIALS]={{"soak: clip positions, client arrays, 2 px area guard, lightmap"}};
-static int trial;
+/* Fatal errors unwind to the frame driver, which stops the game; spinning would freeze the
+ * iPod's UI task. */
+static jmp_buf fatal_jump;
+static int fatal_armed;
+void port_fatal(int code) {
+    (void)code;
+    failed=1;
+    if(fatal_armed)longjmp(fatal_jump,1);
+    for(;;){}
+}
+void plat_fatal(const char *message) {
+    plat_log("fatal: %s",message);port_crumb("fatal",0,0);port_log_flush(DATA_DIR "/log.txt");port_fatal(1);
+}
 
-/* Each mode runs for PHASE_US; a line is logged as each one ends (three writes in all),
- * then the full scene carries on. */
-#define PHASE_US 3000000u
-#define PHASES 2
-/* the scene mode of each phase: with lightmap, without */
-static const uint8_t phase_mode[PHASES]={0,0};
-static struct { uint32_t frames,max_period,work_max,over33;uint64_t period,work; } phase[PHASES];
+/* ---- textures: the original PVRTC files as they are; the PNG sheets as RGBA4444 ---- */
+#ifndef GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+#define GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG 0x8C00
+#endif
+#ifndef GL_LINEAR_MIPMAP_NEAREST
+#define GL_LINEAR_MIPMAP_NEAREST 0x2701
+#endif
+#ifndef GL_UNSIGNED_SHORT_4_4_4_4
+#define GL_UNSIGNED_SHORT_4_4_4_4 0x8033
+#endif
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+static uint32_t texture_bytes;
+static uint32_t u32le(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+unsigned rt_host_load_texture(const char *name,const char *file,int repeat) {
+    char base[48],path[56];uint32_t size=0;GLuint t=0;int ok=0;
+    snprintf(base,sizeof base,"%s",file);
+    char *dot=strrchr(base,'.');int pvr=dot&&!strcmp(dot,".pvr");
+    if(dot)*dot=0;
+    port_crumb("texture",(uint32_t)name[0]<<8|(uint32_t)name[1],0);
+    glGenTextures(1,&t);if(!t){plat_log("texture %s: no texture name",name);return 0;}
+    glBindTexture(GL_TEXTURE_2D,t);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,repeat?GL_REPEAT:GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,repeat?GL_REPEAT:GL_CLAMP_TO_EDGE);
+    snprintf(path,sizeof path,pvr?"%s.pvr":"%s.4444",base);
+    uint8_t *d=plat_read_file(path,&size,0);
+    while(glGetError()){}
+    if(d && pvr && size>52 && u32le(d)==52 && !memcmp(d+44,"PVR!",4)) {
+        /* a 52-byte PVR v2 header, then PVRTC 4bpp levels, largest first */
+        uint32_t h=u32le(d+4),w=u32le(d+8),mips=u32le(d+12),total=u32le(d+20),level=0,lw=w,lh=h,used=0,skip=0,sent=0;
+        const uint8_t *p=d+52,*end=d+52+total;
+        /* The panel is 240 pixels wide: a 1024-pixel texture's largest level is never the one
+         * shown, so it is left out (a quarter of the memory, and less for the GPU to read). */
+        if(mips>=2 && (w>512||h>512))skip=1;
+        if(end<=d+size) {
+            for(;level<=mips&&p<end;level++) {
+                uint32_t bw=lw<8?8:lw,bh=lh<8?8:lh,bytes=bw*bh/2;
+                if(p+bytes>end)break;
+                if(level>=skip) {
+                    glCompressedTexImage2D(GL_TEXTURE_2D,(GLint)(level-skip),GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG,(GLsizei)lw,(GLsizei)lh,0,(GLsizei)bytes,p);
+                    if(glGetError())break;
+                    used+=bytes;sent++;
+                }
+                p+=bytes;
+                if(lw==1&&lh==1){level++;break;}
+                lw=lw>1?lw/2:1;lh=lh>1?lh/2:1;
+            }
+            if(level>mips)glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_NEAREST);
+            ok=sent>=1;texture_bytes+=used;
+        }
+    } else if(d && !pvr && size>8 && size==8+u32le(d)*u32le(d+4)*2) {
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,(GLsizei)u32le(d),(GLsizei)u32le(d+4),0,GL_RGBA,GL_UNSIGNED_SHORT_4_4_4_4,d+8);
+        ok=!glGetError();texture_bytes+=size-8;
+    }
+    free(d);
+    if(!ok){plat_log("texture %s (%s): could not be loaded",name,path);glDeleteTextures(1,&t);return 0;}
+    return t;
+}
+void rt_host_sound(const char *name,int loop,float pitch,int stop){(void)name;(void)loop;(void)pitch;(void)stop;}
+
+/* ---- frames ---- */
+/* The engine advances by the time that has really passed (as on the phone), so the frame
+ * rate only sets how smooth it looks. Frames are held to a 30 Hz beat when the work fits. */
+#define BEAT_US 33333u
+static uint32_t gap_short=5200,gap_long=8600,gap_estimate=6500;
+static struct { uint32_t frames,max_period,max_work,over40,triangles,draws,dropped;uint64_t period,work,engine; } perf;
 
 void tr_nano_frame(int w,int h,uint32_t frame) {
-    static uint64_t last,start;static uint32_t previous_frame;static int reported;
+    static uint64_t last,previous_end,started;static uint32_t previous_frame,count;static int reports,touching;
     if(w<1||h<1||failed)return;
-    if(initialized && frame<previous_frame){initialized=0;last=0;}       /* new GL view: textures are gone */
+    fatal_armed=1;
+    if(setjmp(fatal_jump)){fatal_armed=0;return;}
+    if(initialized && frame<previous_frame) {           /* a new GL view: our textures are gone */
+        plat_log("the GL view was recreated; stopping");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;
+    }
     previous_frame=frame;
     if(!initialized) {
         uint64_t t0=plat_time_us();
-        plat_log("Temple Run hardware test: panel %dx%d, heap free %u, largest %u, redraw %s",w,h,hb_os_heap_free(),
+        plat_log("Temple Run: panel %dx%d, heap free %u, largest %u, redraw %s",w,h,hb_os_heap_free(),
                  hb_os_heap_largest(),tr_fast_redraw?"2 ms heartbeat":"16 ms heartbeat");
         save_previous_crumbs("prevboot.txt");
-        plat_log("%s",trials[0].name);
-        port_crumb("trial",(uint32_t)trial,0);
-        if(manifest() || scene_init()) {
-            plat_log("initialization failed");port_log_flush(DATA_DIR "/log.txt");failed=1;return;
+        port_crumb("init",0,0);
+        uint32_t marker=0;void *flag=NULL;
+        if(manifest()){plat_log("files.lst is missing");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;}
+        flag=plat_read_file("autopilot.txt",&marker,1);
+        if(flag){free(flag);game_autopilot(1);plat_log("autopilot on");}
+        if(!game_init(w,h,0x130000u,hb_time_uptime_us()|1u)) {
+            plat_log("initialization failed");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;
         }
         initialized=1;
-        plat_log("loaded in %u ms: heap free %u, largest %u, textures %u KiB",(unsigned)((plat_time_us()-t0)/1000u),
-                 hb_os_heap_free(),hb_os_heap_largest(),tex_bytes/1024u);
+        plat_log("loaded in %u ms: heap free %u, largest %u; engine heap %u of %u; models %u; textures %u",
+                 (unsigned)((plat_time_us()-t0)/1000u),hb_os_heap_free(),hb_os_heap_largest(),(unsigned)rt_heap_peak(),0x130000u,
+                 fe_buffer_bytes,(unsigned)texture_bytes);
         port_log_flush(DATA_DIR "/log.txt");
-        start=0;last=0;
+        last=0;previous_end=0;started=plat_time_us();
     }
     keep_awake();
     uint64_t now=plat_time_us();
-    if(!start)start=now+500000u;                    /* let the first frames settle */
-    uint32_t period=last?(uint32_t)(now-last):0;
-    int index=0,mode=0;
-    static int logged;
-    static uint32_t count;
-    if(!reported && now>=start) {
-        uint32_t elapsed=(uint32_t)(now-start);
-        index=(int)(elapsed/PHASE_US);
-        while(logged<index && logged<PHASES) {
-            int i=logged++;
-            uint32_t n=phase[i].frames?phase[i].frames:1;
-            uint32_t fps10=phase[i].period?(uint32_t)((uint64_t)phase[i].frames*10000000u/phase[i].period):0;
-            port_crumb("log",(uint32_t)i,0);
-            plat_log("phase %d mode %d: frames=%u fps=%u.%u work_us=%u work_max=%u period_max=%u over_33ms=%u; %d draws, %d vertices in, %d triangles out, %d tiny, %d clipped",
-                     i,(int)phase_mode[i],phase[i].frames,fps10/10,fps10%10,(unsigned)(phase[i].work/n),phase[i].work_max,
-                     phase[i].max_period,phase[i].over33,scene_stat_draws,scene_stat_vertices,scene_stat_triangles,
-                     r3d_stat_tiny,r3d_stat_clipped);
-            port_crumb("flush",(uint32_t)i,0);
-            port_log_flush(DATA_DIR "/log.txt");
-            port_crumb("flushed",(uint32_t)i,0);
-            last=0;
-        }
-        if(index>=PHASES && !reported) {
-            char text[200],name[16];
-            uint32_t f0=phase[0].period?(uint32_t)((uint64_t)phase[0].frames*10000000u/phase[0].period):0;
-            uint32_t f1=phase[1].period?(uint32_t)((uint64_t)phase[1].frames*10000000u/phase[1].period):0;
-            int n=snprintf(text,sizeof text,"trial %d (%s) ran 6 s: with lightmap %u.%u fps, work %u us; without %u.%u fps, work %u us\n",
-                           trial,trials[trial].name,(unsigned)(f0/10),(unsigned)(f0%10),
-                           (unsigned)(phase[0].work/(phase[0].frames?phase[0].frames:1)),(unsigned)(f1/10),(unsigned)(f1%10),
-                           (unsigned)(phase[1].work/(phase[1].frames?phase[1].frames:1)));
-            snprintf(name,sizeof name,"trial-%d.txt",trial);
-            port_crumb("result",(uint32_t)trial,0);
-            if(n>0)plat_write_file(name,text,(uint32_t)n);
-            last=0;
-        }
-        if(index>=PHASES){reported=1;index=0;}
-        mode=phase_mode[index];
+    uint32_t period=last?(uint32_t)(now-last):BEAT_US;
+    uint32_t gap=previous_end?(uint32_t)(now-previous_end):0;
+    if(gap>2000u && gap<16000u) {                       /* the platform redraws in pairs: a short gap, then a long one */
+        int was_short=gap<(gap_short+gap_long)/2u;
+        if(was_short)gap_short=(gap_short*7u+gap)/8u;else gap_long=(gap_long*7u+gap)/8u;
+        gap_estimate=was_short?gap_long:gap_short;
     }
+    last=now;
 
-    last=plat_time_us();now=last;        /* a log write above must not count as a frame */
-    float dt=period?(float)period*1e-6f:1.f/30.f;
-    if(dt>0.1f)dt=0.1f;
-    /* two more lines if it keeps running: the crash this build is meant to cure came at random */
-    {
-        static int alive;
-        uint32_t seconds=now>start?(uint32_t)((now-start)/1000000u):0;
-        static const uint16_t marks[5]={30,90,180,300,600};
-        if(reported && alive<5 && seconds>=marks[alive]) {
-            alive++;
-            plat_log("still running after %u s, %u frames, heap free %u",(unsigned)seconds,(unsigned)count,hb_os_heap_free());
-            port_log_flush(DATA_DIR "/log.txt");
-            last=0;
-        }
-    }
-    port_crumb("draw",(count<<4)|(uint32_t)mode,0);
-    scene_frame(w,h,dt,mode);
+    hb_spoint_t finger;hb_surface_touch_read(&finger);
+    if(finger.down){game_touch(touching?1:0,(float)finger.x,(float)finger.y);touching=1;}
+    else if(touching){game_touch(2,(float)finger.x,(float)finger.y);touching=0;}
+    int32_t g[3]={0,0,0};hb_accel_read_milli_g(g);
+    float tilt=(float)-g[0]*0.001f;                     /* the phone reports gravity; the nano the opposite */
+    game_tilt(tilt>1.f?1.f:tilt<-1.f?-1.f:tilt);
+
+    port_crumb("frame",count,0);
+    uint64_t t1=plat_time_us();
+    game_frame((float)(period>250000u?250000u:period)*1e-6f);
+    uint32_t work=(uint32_t)(plat_time_us()-now);
     port_crumb("drawn",count++,0);
-    if(!reported && now>=start && period) {
-        uint32_t work=(uint32_t)(plat_time_us()-now);
-        phase[index].frames++;phase[index].period+=period;phase[index].work+=work;
-        if(period>phase[index].max_period)phase[index].max_period=period;
-        if(work>phase[index].work_max)phase[index].work_max=work;
-        phase[index].over33+=period>33333u;
+    if(last!=now)period=0;
+    perf.frames++;perf.period+=period;perf.work+=work;perf.engine+=(uint32_t)(fe_time_engine_us);
+    perf.triangles+=(uint32_t)fe_stat_triangles_out;perf.draws+=(uint32_t)fe_stat_draws;perf.dropped+=(uint32_t)fe_stat_dropped;
+    if(period>perf.max_period)perf.max_period=period;
+    if(work>perf.max_work)perf.max_work=work;
+    perf.over40+=period>40000u;
+    (void)t1;
+
+    if(tr_fast_redraw && work+gap_estimate<BEAT_US) {    /* hold the 30 Hz beat (a spin: the UI task has no sleep) */
+        static uint64_t slot;
+        if(!slot || now>slot+BEAT_US || now+BEAT_US<slot)slot=now;
+        slot+=BEAT_US;
+        uint64_t until=slot-gap_estimate;
+        while(plat_time_us()<until){}
     }
+    /* A line of timings at a few moments (never per frame: file writes stall the iPod). */
+    static const uint16_t marks[8]={10,30,60,120,300,600,1200,2400};
+    uint32_t seconds=(uint32_t)((plat_time_us()-started)/1000000u);
+    if(reports<8 && seconds>=marks[reports] && perf.frames) {
+        reports++;
+        uint32_t fps10=perf.period?(uint32_t)((uint64_t)perf.frames*10000000u/perf.period):0;
+        plat_log("%u s: %u frames, %u.%u fps, work %u us (engine %u), max work %u, max period %u, over 40 ms %u; per frame %u triangles, %u draws; dropped %u; state %d, distance %d; heap free %u, engine heap %u",
+                 (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),perf.max_work,
+                 perf.max_period,perf.over40,perf.triangles/perf.frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
+                 hb_os_heap_free(),(unsigned)rt_heap_peak());
+        port_log_flush(DATA_DIR "/log.txt");
+        memset(&perf,0,sizeof perf);
+        last=0;
+    }
+    previous_end=plat_time_us();
+    fatal_armed=0;
 }

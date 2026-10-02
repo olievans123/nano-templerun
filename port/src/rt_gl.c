@@ -38,3 +38,4 @@ void imp_glColorPointer(void) { fe_color_pointer((int)R0, R1, (int)R2, R3); DONE
 void imp_glNormalPointer(void) { fe_normal_pointer(R0, (int)R1, R2); DONE(); }
 void imp_glDrawArrays(void) { fe_draw_arrays(R0, (int)R1, (int)R2); DONE(); }
 void imp_glDrawElements(void) { fe_draw_elements(R0, (int)R1, R2, R3); DONE(); }
+void rt_note_mesh(uint32_t mesh) { fe_note_mesh(mesh); }

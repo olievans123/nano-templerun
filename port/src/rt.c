@@ -40,94 +40,139 @@ uint8_t *rt_checked(uint32_t addr, uint32_t size) {
 #endif
 
 /* ---- heap -------------------------------------------------------------------------------- */
-/* Blocks are multiples of 16 bytes with a 16-byte header (size, next free). Freed blocks go on
- * a last-in-first-out list per size and are zeroed when handed out again. */
-#define SMALL_MAX 65536u
-static uint32_t sFree[SMALL_MAX / 16 + 1];
-static uint32_t sFreeLarge;
+/* Blocks carry a 16-byte header (size and flags, the size of the block before, and the free
+ * list links) and are multiples of 16 bytes. Freed blocks merge with free neighbours and are
+ * kept in lists by size class; a free block at the top of the heap is given back to it. Memory
+ * is zeroed when handed out. The reference harness has the same allocator, so addresses match. */
+#define H_SIZE(b) M32(b)
+#define H_PREV_SIZE(b) M32((b) + 4)
+#define H_PREV_FREE(b) M32((b) + 8)
+#define H_NEXT_FREE(b) M32((b) + 12)
+#define USED 1u
+#define PINNED 2u
+#define PINNED_FREED 4u
+#define BINS 28
+#define MIN_SPLIT 64u
+static uint32_t sBins[BINS], sTopSize;      /* sTopSize: the size of the last block below the break */
 
-uint32_t rt_alloc(uint32_t size) {
-    uint32_t n = size < 16 ? 16 : (size + 15) & ~15u, addr = 0;
-    if (n <= SMALL_MAX) {
-        addr = sFree[n / 16];
-        if (addr) sFree[n / 16] = M32(addr - 12);
-    } else {
-        uint32_t prev = 0;
-        for (uint32_t a = sFreeLarge; a; prev = a, a = M32(a - 12))
-            if (M32(a - 16) == n) {
-                if (prev) M32(prev - 12) = M32(a - 12); else sFreeLarge = M32(a - 12);
-                addr = a;
-                break;
-            }
+static uint32_t block_size(uint32_t b) { return H_SIZE(b) & ~15u; }
+static unsigned bin_for(uint32_t size) { return 27u - (unsigned)__builtin_clz(size); }
+static void insert_free(uint32_t b) {
+    unsigned bin = bin_for(block_size(b));
+    H_PREV_FREE(b) = 0;
+    H_NEXT_FREE(b) = sBins[bin];
+    if (sBins[bin]) H_PREV_FREE(sBins[bin]) = b;
+    sBins[bin] = b;
+}
+static void remove_free(uint32_t b) {
+    if (H_PREV_FREE(b)) H_NEXT_FREE(H_PREV_FREE(b)) = H_NEXT_FREE(b);
+    else sBins[bin_for(block_size(b))] = H_NEXT_FREE(b);
+    if (H_NEXT_FREE(b)) H_PREV_FREE(H_NEXT_FREE(b)) = H_PREV_FREE(b);
+}
+static void set_next_prev(uint32_t b) {
+    uint32_t next = b + block_size(b);
+    if (next < sBrk) H_PREV_SIZE(next) = block_size(b); else sTopSize = block_size(b);
+}
+/* b is free and on no list: merge it with free neighbours, then list it or lower the break. */
+static void release_block(uint32_t b) {
+    H_SIZE(b) = block_size(b);
+    uint32_t next = b + block_size(b);
+    if (next < sBrk && !(H_SIZE(next) & USED)) {
+        remove_free(next);
+        H_SIZE(b) += block_size(next);
     }
-    if (addr) {
-        memset(g_mem + addr, 0, n);
-    } else {
-        if (sBrk + n + 16 > sHeapEnd) die("guest heap exhausted (%u bytes wanted, %u in use)", (unsigned)n, (unsigned)sHeapUsed);
-        addr = sBrk + 16;
-        M32(addr - 16) = n;
-        sBrk += n + 16;
+    if (H_PREV_SIZE(b)) {
+        uint32_t prev = b - H_PREV_SIZE(b);
+        if (!(H_SIZE(prev) & USED)) {
+            remove_free(prev);
+            H_SIZE(prev) += block_size(b);
+            b = prev;
+        }
     }
-    M32(addr - 12) = 0;
-#ifdef RT_TRACE
-    { uint32_t r0 = R0, r1 = R1; R0 = size; R1 = addr; rt_trace(0xa110c); R0 = r0; R1 = r1; }
-#endif
-    sHeapUsed += n + 16;
-    if (sHeapUsed > sHeapPeak) sHeapPeak = sHeapUsed;
-    return addr;
+    if (b + block_size(b) == sBrk) {            /* at the top: give it back */
+        sBrk = b;
+        sTopSize = H_PREV_SIZE(b);
+        return;
+    }
+    set_next_prev(b);
+    insert_free(b);
 }
 
-/* A block the port wants to go on using after the engine frees it (vertex data handed to
- * OpenGL): the free is remembered and takes effect when the block is unpinned. */
-#define PINNED 0x214e4950u
-#define PINNED_FREED 0x464e4950u
+#ifdef RT_TRACE
+void rt_trace(uint32_t addr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3);
+#endif
+uint32_t rt_alloc(uint32_t size) {
+    if (SP && SP < sStackLow) sStackLow = SP;
+    uint32_t need = (size < 16 ? 16 : (size + 15) & ~15u) + 16, b = 0;
+    for (unsigned bin = bin_for(need); bin < BINS && !b; bin++)
+        for (uint32_t c = sBins[bin]; c; c = H_NEXT_FREE(c))
+            if (block_size(c) >= need) { b = c; break; }
+    if (b) {
+        remove_free(b);
+        uint32_t available = block_size(b);
+        if (available - need >= MIN_SPLIT) {
+            uint32_t tail = b + need;
+            H_SIZE(b) = need | USED;
+            H_SIZE(tail) = available - need;
+            H_PREV_SIZE(tail) = need;
+            set_next_prev(tail);
+            insert_free(tail);
+        } else {
+            H_SIZE(b) = available | USED;
+        }
+    } else {
+        if (sBrk + need > sHeapEnd) die("guest heap exhausted (%u bytes wanted, %u in use)", (unsigned)size, (unsigned)sHeapUsed);
+        b = sBrk;
+        H_SIZE(b) = need | USED;
+        H_PREV_SIZE(b) = sBrk == RT_HEAP ? 0 : sTopSize;
+        sBrk += need;
+        sTopSize = need;
+        if (sBrk - RT_HEAP > sHeapPeak) sHeapPeak = sBrk - RT_HEAP;
+    }
+    H_PREV_FREE(b) = H_NEXT_FREE(b) = 0;
+    memset(g_mem + b + 16, 0, block_size(b) - 16);
+#ifdef RT_TRACE
+    rt_trace(0xa110c, size, b + 16, 0, 0);
+#endif
+    sHeapUsed += block_size(b);
+    return b + 16;
+}
+
+static int is_block(uint32_t addr) { return addr >= RT_HEAP + 16 && addr < sBrk && !(addr & 15) && (H_SIZE(addr - 16) & USED); }
+
+/* A block the port wants to go on using after the engine frees it: the free is remembered
+ * and takes effect when the block is unpinned. */
 int rt_pin(uint32_t addr, uint32_t size) {
-    if (addr < RT_HEAP + 16 || addr >= sBrk || (addr & 15)) return 0;
-    uint32_t n = M32(addr - 16);
-    if ((n & 15) || n < size || n > size + 32 || M32(addr - 8)) return 0;
-    M32(addr - 8) = PINNED;
+    if (!is_block(addr) || block_size(addr - 16) - 16 < size || (H_SIZE(addr - 16) & (PINNED | PINNED_FREED))) return 0;
+    H_SIZE(addr - 16) |= PINNED;
     return 1;
 }
 void rt_unpin(uint32_t addr) {
-    uint32_t state = M32(addr - 8);
-    M32(addr - 8) = 0;
-    if (state == PINNED_FREED) rt_free(addr);
+    if (!is_block(addr)) return;
+    uint32_t flags = H_SIZE(addr - 16);
+    H_SIZE(addr - 16) &= ~(PINNED | PINNED_FREED);
+    if (flags & PINNED_FREED) rt_free(addr);
 }
 
 void rt_free(uint32_t addr) {
-    if (addr < RT_HEAP + 16 || addr >= sBrk) return;
-    if (M32(addr - 8) == PINNED) { M32(addr - 8) = PINNED_FREED; return; }
-    if (M32(addr - 8) == PINNED_FREED) return;
-    uint32_t n = M32(addr - 16);
+    if (!is_block(addr)) return;
+    uint32_t b = addr - 16;
+    if (H_SIZE(b) & PINNED_FREED) return;
+    if (H_SIZE(b) & PINNED) { H_SIZE(b) |= PINNED_FREED; return; }
 #ifdef RT_TRACE
-    { uint32_t r0 = R0, r1 = R1; R0 = n; R1 = addr; rt_trace(0xf4ee); R0 = r0; R1 = r1; }
+    rt_trace(0xf4ee, block_size(b), addr, 0, 0);
 #endif
-    sHeapUsed -= n + 16;
-    if (n <= SMALL_MAX) {
-        M32(addr - 12) = sFree[n / 16];
-        sFree[n / 16] = addr;
-    } else {
-        M32(addr - 12) = sFreeLarge;
-        sFreeLarge = addr;
-    }
+    sHeapUsed -= block_size(b);
+    release_block(b);
 }
 
 uint32_t rt_heap_used(void) { return sHeapUsed; }
-uint32_t rt_heap_peak(void) { return sBrk - RT_HEAP; }
+uint32_t rt_heap_peak(void) { return sHeapPeak; }
+uint32_t rt_heap_break(void) { return sBrk; }
 uint32_t rt_stack_low(void) { return sStackLow; }
 
 /* ---- calls ------------------------------------------------------------------------------- */
-void rt_call(uint32_t addr) {
-    int lo = 0, hi = rt_function_count - 1;
-    if (SP < sStackLow) sStackLow = SP;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        if (rt_functions[mid].addr == addr) { rt_functions[mid].fn(); return; }
-        if (rt_functions[mid].addr < addr) lo = mid + 1; else hi = mid - 1;
-    }
-    die("call to %x, which is not a translated function", (unsigned)addr);
-}
-
+void rt_bad_call(uint32_t addr) { die("call to %x, which is not a translated function", (unsigned)addr); }
 void rt_bad_jump(uint32_t addr) { die("jump to an unexpected address %x", (unsigned)addr); }
 void rt_missing(const char *name) { die("call to %s, which was left out of the translation", name); }
 
@@ -156,8 +201,9 @@ uint32_t rt_invoke(uint32_t addr, int argc, ...) {
     uint32_t entry = SP;
     R0 = argc > 0 ? args[0] : 0; R1 = argc > 1 ? args[1] : 0; R2 = argc > 2 ? args[2] : 0; R3 = argc > 3 ? args[3] : 0;
     sDepth++;
-    rt_call(addr);
+    uint64_t result = rt_enter(addr, R0, R1, R2, R3);
     sDepth--;
+    R0 = (uint32_t)result; R1 = (uint32_t)(result >> 32);
     if (SP != entry) die("stack pointer %x after a call to %x that began at %x", (unsigned)SP, (unsigned)addr, (unsigned)entry);
     SP = saved;
     return R0;
@@ -335,8 +381,8 @@ static void open_input(uint32_t obj, const char *path) {
     uint32_t size = 0;
     const char *name = base_name(path);
     snprintf(s->name, sizeof s->name, "%s", name);
-    s->data = *name ? plat_read_file(name, &size, 1) : NULL;
-    if (!s->data && *name) s->data = plat_read_file(name, &size, 0);
+    s->data = *name ? plat_read_file(name, &size, 0) : NULL;       /* the game's data, else something it saved */
+    if (!s->data && *name) s->data = plat_read_file(name, &size, 1);
     s->owned = 1;
     s->size = size;
     s->fail = s->data == NULL;
@@ -405,6 +451,35 @@ void imp__ZNSi7getlineEPci(void) {
     memcpy(g_mem + R1, s->data + start, len);
     M8(R1 + len) = 0;
 }
+/* Decimal text to a number without the C library's locale machinery; exact (correctly
+ * rounded) for up to 15 significant digits and exponents within +-22, which covers the data. */
+static double parse_number(const char *t, char **end) {
+    static const double pow10[] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+                                    1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
+    const char *p = t;
+    int negative = 0, digits = 0, any = 0, exponent = 0;
+    double mantissa = 0.0;
+    if (*p == '-' || *p == '+') negative = *p++ == '-';
+    for (; *p >= '0' && *p <= '9'; p++, any = 1)
+        if (digits < 17) { mantissa = mantissa * 10.0 + (*p - '0'); if (mantissa != 0.0) digits++; } else exponent++;
+    if (*p == '.')
+        for (p++; *p >= '0' && *p <= '9'; p++, any = 1)
+            if (digits < 17) { mantissa = mantissa * 10.0 + (*p - '0'); if (mantissa != 0.0) digits++; exponent--; }
+    if (!any) { *end = (char *)t; return 0.0; }
+    if (*p == 'e' || *p == 'E') {
+        const char *q = p + 1;
+        int sign = 1, e = 0, seen = 0;
+        if (*q == '-' || *q == '+') sign = *q++ == '-' ? -1 : 1;
+        for (; *q >= '0' && *q <= '9'; q++, seen = 1) if (e < 1000) e = e * 10 + (*q - '0');
+        if (seen) { exponent += sign * e; p = q; }
+    }
+    *end = (char *)p;
+    while (exponent > 22) { mantissa *= 1e22; exponent -= 22; }
+    while (exponent < -22) { mantissa /= 1e22; exponent += 22; }
+    mantissa = exponent >= 0 ? mantissa * pow10[exponent] : mantissa / pow10[-exponent];
+    return negative ? -mantissa : mantissa;
+}
+
 static int is_space(int c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; }
 static int stream_token(Stream *s, char *out, uint32_t max) {
     if (s->fail) return 0;
@@ -429,7 +504,7 @@ void imp__ZNSirsERf(void) {
     Stream *s = stream_of(R0);
     char t[64], *end;
     if (!stream_token(s, t, sizeof t)) return;
-    double v = strtod(t, &end);
+    double v = parse_number(t, &end);
     if (*end || end == t) s->fail = 1; else MF(R1) = (float)v;
 }
 void imp__ZNSirsERb(void) {
@@ -613,7 +688,8 @@ static void load_config(void) {
             if (n > sizeof number - 1) n = sizeof number - 1;
             memcpy(number, space + 1, n);
             number[n] = 0;
-            e->value = strtod(number, NULL);
+            char *stop;
+            e->value = parse_number(number, &stop);
         }
         p = nl + 1;
     }

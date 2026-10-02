@@ -41,10 +41,8 @@ void rt_host_sound(const char *name, int loop, float pitch, int stop) { (void)na
 
 #ifdef RT_TRACE
 static FILE *sTrace;
-void rt_trace(uint32_t addr) {
-    if (!sTrace) return;
-    if (addr == 0xa110c || addr == 0xf4ee) fprintf(sTrace, "%x %x %x 0 0\n", addr, R0, R1);
-    else fprintf(sTrace, "%x %x %x %x %x\n", addr, R0, R1, R2, R3);
+void rt_trace(uint32_t addr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
+    if (sTrace) fprintf(sTrace, "%x %x %x %x %x\n", addr, r0, r1, r2, r3);
 }
 #endif
 
@@ -55,7 +53,7 @@ int main(int argc, char **argv) {
 #ifdef RT_TRACE
     if (argc > 6) sTrace = fopen(argv[6], "w");
 #endif
-    if (!rt_init(64u << 20)) return 1;
+    if (!rt_init(6u << 20)) return 1;
     rt_srandom((uint32_t)atoi(argv[4]));
     uint32_t game = rt_alloc(596);
     rt_invoke(rt_lookup("__ZN15cGameControllerC1Efffb"), 5, game, rt_fbits(320.0f), rt_fbits(480.0f), rt_fbits(1.0f), 0u);
@@ -85,7 +83,7 @@ int main(int argc, char **argv) {
         rt_invoke(draw, 1, game);
     }
     FILE *out = fopen(argv[5], "wb");
-    uint32_t brk = RT_HEAP + rt_heap_peak();
+    uint32_t brk = rt_heap_break();
     fwrite(&brk, 4, 1, out);
     fwrite(g_mem + 0xd9000, 1, RT_IMAGE_HI - 0xd9000, out);
     fwrite(g_mem + RT_EXTERN, 1, RT_LITERALS - RT_EXTERN, out);

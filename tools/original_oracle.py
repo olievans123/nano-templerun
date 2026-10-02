@@ -25,7 +25,7 @@ REGS = [UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3]
 # and the translated engine there can be compared byte for byte.
 GUEST_SIZE = 0x6000000
 EXTERN, FAKE_VTABLE, SOUND_MANAGER, FAKE_FUNCS = 0xea000, 0xf3e20, 0xf3c00, 0xf3f00
-LITERALS, STACK_TOP, HEAP = 0xf4000, 0x120000, 0x120000
+LITERALS, STACK_TOP, HEAP = 0xf4000, 0x100000, 0x100000
 IMPORTS = 0x8000000
 SMALL_MAX = 65536
 BX_LR = 0xe12fff1e
@@ -169,7 +169,7 @@ class Original:
 
         self.next = HEAP
         self.tracing = False
-        self.free_lists, self.free_large, self.heap_used = {}, 0, 0
+        self.bins, self.top_size, self.heap_used = [0] * 28, 0, 0
         self.random = BsdRandom(seed)
         self.seed_override = seed
         self.streams = {}
@@ -264,53 +264,107 @@ class Original:
                           + struct.pack('<256I', *upper))
 
     # ---- memory -------------------------------------------------------------------------
+    # The allocator of port/src/rt.c, statement for statement: 16-byte headers (size and
+    # flags, size of the block before, free list links), merging of free neighbours, lists
+    # by size class, a free block at the top given back, memory zeroed when handed out.
+    def block_size(self, b):
+        return self.word(b) & ~15
+
+    @staticmethod
+    def bin_for(size):
+        return size.bit_length() - 5
+
+    def insert_free(self, b):
+        k = self.bin_for(self.block_size(b))
+        self.put(b + 8, 0)
+        self.put(b + 12, self.bins[k])
+        if self.bins[k]:
+            self.put(self.bins[k] + 8, b)
+        self.bins[k] = b
+
+    def remove_free(self, b):
+        prev, nxt = self.word(b + 8), self.word(b + 12)
+        if prev:
+            self.put(prev + 12, nxt)
+        else:
+            self.bins[self.bin_for(self.block_size(b))] = nxt
+        if nxt:
+            self.put(nxt + 8, prev)
+
+    def set_next_prev(self, b):
+        nxt = b + self.block_size(b)
+        if nxt < self.next:
+            self.put(nxt + 4, self.block_size(b))
+        else:
+            self.top_size = self.block_size(b)
+
+    def release_block(self, b):
+        self.put(b, self.block_size(b))
+        nxt = b + self.block_size(b)
+        if nxt < self.next and not self.word(nxt) & 1:
+            self.remove_free(nxt)
+            self.put(b, self.word(b) + self.block_size(nxt))
+        if self.word(b + 4):
+            prev = b - self.word(b + 4)
+            if not self.word(prev) & 1:
+                self.remove_free(prev)
+                self.put(prev, self.word(prev) + self.block_size(b))
+                b = prev
+        if b + self.block_size(b) == self.next:
+            self.next = b
+            self.top_size = self.word(b + 4)
+            return
+        self.set_next_prev(b)
+        self.insert_free(b)
+
     def alloc(self, size):
-        """Blocks are multiples of 16 bytes with a 16-byte header (size, next free); freed
-        blocks go on a last-in-first-out list per size and are zeroed when handed out again."""
-        n = max(16, (size + 15) & ~15)
-        addr = 0
-        if n <= SMALL_MAX:
-            addr = self.free_lists.get(n, 0)
-            if addr:
-                self.free_lists[n] = self.word(addr - 12)
-        else:
-            prev, a = 0, self.free_large
-            while a:
-                if self.word(a - 16) == n:
-                    if prev:
-                        self.put(prev - 12, self.word(a - 12))
-                    else:
-                        self.free_large = self.word(a - 12)
-                    addr = a
+        need = max(16, (size + 15) & ~15) + 16
+        b = 0
+        for k in range(self.bin_for(need), 28):
+            c = self.bins[k]
+            while c:
+                if self.block_size(c) >= need:
+                    b = c
                     break
-                prev, a = a, self.word(a - 12)
-        if addr:
-            self.uc.mem_write(addr, bytes(n))
+                c = self.word(c + 12)
+            if b:
+                break
+        if b:
+            self.remove_free(b)
+            available = self.block_size(b)
+            if available - need >= 64:
+                tail = b + need
+                self.put(b, need | 1)
+                self.put(tail, available - need)
+                self.put(tail + 4, need)
+                self.set_next_prev(tail)
+                self.insert_free(tail)
+            else:
+                self.put(b, available | 1)
         else:
-            if self.next + n + 16 > GUEST_SIZE:
+            if self.next + need > GUEST_SIZE:
                 raise MemoryError('reference heap exhausted')
-            addr = self.next + 16
-            self.put(addr - 16, n)
-            self.next += n + 16
-        self.put(addr - 12, 0)
-        self.heap_used += n + 16
+            b = self.next
+            self.put(b, need | 1)
+            self.put(b + 4, 0 if self.next == HEAP else self.top_size)
+            self.next += need
+            self.top_size = need
+        self.put(b + 8, 0)
+        self.put(b + 12, 0)
+        self.uc.mem_write(b + 16, bytes(self.block_size(b) - 16))
         if self.tracing:
-            self.trace.append((0xa110c, size, addr, 0, 0))
-        return addr
+            self.trace.append((0xa110c, size, b + 16, 0, 0))
+        self.heap_used += self.block_size(b)
+        return b + 16
 
     def free(self, addr):
-        if addr < HEAP + 16 or addr >= self.next:
+        if addr < HEAP + 16 or addr >= self.next or addr & 15 or not self.word(addr - 16) & 1:
             return
-        n = self.word(addr - 16)
+        b = addr - 16
         if self.tracing:
-            self.trace.append((0xf4ee, n, addr, 0, 0))
-        self.heap_used -= n + 16
-        if n <= SMALL_MAX:
-            self.put(addr - 12, self.free_lists.get(n, 0))
-            self.free_lists[n] = addr
-        else:
-            self.put(addr - 12, self.free_large)
-            self.free_large = addr
+            self.trace.append((0xf4ee, self.block_size(b), addr, 0, 0))
+        self.heap_used -= self.block_size(b)
+        self.release_block(b)
 
     def word(self, addr):
         return struct.unpack('<I', self.uc.mem_read(addr, 4))[0]

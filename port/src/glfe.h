@@ -38,6 +38,8 @@ void fe_color_pointer(int size, uint32_t type, int stride, uint32_t pointer);
 void fe_normal_pointer(uint32_t type, int stride, uint32_t pointer);
 void fe_draw_arrays(uint32_t mode, int first, int count);
 void fe_draw_elements(uint32_t mode, int count, uint32_t type, uint32_t indices);
+/* The engine is about to upload this mesh's vertices and indices (a guest address). */
+void fe_note_mesh(uint32_t mesh);
 
 /* ---- for the port's own code (glfe.c) -------------------------------------------------------- */
 void fe_reset(void);                                /* once, before the engine starts */
@@ -45,5 +47,8 @@ void fe_frame_begin(int panel_w, int panel_h);      /* clears; the engine's draw
 void fe_frame_end(void);                            /* hands the frame's triangles to OpenGL */
 extern int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_triangles_out, fe_stat_tiny,
            fe_stat_clipped, fe_stat_dropped, fe_stat_calls, fe_stat_fogged;
+extern unsigned fe_time_engine_us;                  /* the last frame's time in the engine's simulate() */
+extern int fe_peak_vertices, fe_peak_chunks, fe_peak_batches;
+extern unsigned fe_buffer_bytes;                    /* memory held for the engine's buffer objects */
 extern int fe_stat_outside;     /* host builds: vertices that reached GL on or outside a clip boundary (must stay 0) */
 #endif

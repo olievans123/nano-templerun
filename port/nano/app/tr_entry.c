@@ -16,7 +16,7 @@ void *payload_entry(int op,void *fb,int w,int h,hb_shared_t *sh);
 static int restore_data(void) {
     extern uint8_t __data_start[],_edata[];
     uint32_t size=hb_fs_size(APP_FILE);
-    if(size<24 || size>2u*1024u*1024u)return 0;
+    if(size<24 || size>3u*1024u*1024u)return 0;
     uint32_t cap=(size+8191u)&~4095u;
     uint8_t *buf=hb_os_alloc(cap);
     if(!buf)return 0;

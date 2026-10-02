@@ -32,3 +32,4 @@ void fe_color_pointer(int size, uint32_t type, int stride, uint32_t pointer) { (
 void fe_normal_pointer(uint32_t type, int stride, uint32_t pointer) { (void)type; (void)stride; (void)pointer; }
 void fe_draw_arrays(uint32_t mode, int first, int count) { (void)mode; (void)first; (void)count; }
 void fe_draw_elements(uint32_t mode, int count, uint32_t type, uint32_t indices) { (void)mode; (void)count; (void)type; (void)indices; }
+void fe_note_mesh(uint32_t mesh) { (void)mesh; }

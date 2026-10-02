@@ -109,6 +109,9 @@ class Image:
         return '[' in name or name.startswith(('___', '_OBJC', '__GLOBAL__I_OBJC'))
 
 
+# Engine functions that tell the port they are starting (the function itself still runs).
+NOTIFY = {'__ZN7cMesh3D25createVertexBufferObjectsEv': 'rt_note_mesh'}
+CALLEE_SAVED = {'r4', 'r5', 'r6', 'r7', 'r8', 'r10', 'r11', 'lr'}
 LITERALS_BASE = 0xf4000
 LITERALS = {}           # original address -> (new address, bytes)
 
@@ -559,6 +562,11 @@ class Function:
                         raise Unsupported('store of pc')
                     ret = True
                     continue
+                # The registers a function must preserve are saved on entry and restored on exit.
+                # Here they are C locals of the caller, so the save and the restore have nothing to
+                # do: only the stack pointer moves.
+                if m in (ARM_INS_PUSH, ARM_INS_POP) and name in CALLEE_SAVED:
+                    continue
                 self.used.add(name)
                 if load:
                     body.append('%s = M32(ea + %d);' % (name, 4 * i))
@@ -579,17 +587,16 @@ class Function:
             if self.addr <= target < self.end:
                 out.append('goto L_%x;' % target)
             else:
-                out.append(self.call(target, pc))
-                out.append('return;')
+                out.append(self.tail_call(target, pc))
         elif m == ARM_INS_BL or (m == ARM_INS_BLX and o[0].type == ARM_OP_IMM):
             out.append(self.call(o[0].imm, pc))
         elif m == ARM_INS_BLX:
-            out.append('CALL(rt_call(%s));' % R(0))
+            out.append('CALL(rt_call(%s, r0, r1, r2, r3));' % R(0))
         elif m == ARM_INS_BX:
             if creg(self.md.reg_name(o[0].reg)) == 'lr':
                 out.append('RETURN();')
             else:
-                out.append('SYNC(); rt_call(%s); return;' % R(0))
+                out.append('return rt_call(%s, r0, r1, r2, r3);' % R(0))
         elif ins.mnemonic.startswith('v'):
             out += self.vfp(pc, ins)
         elif m == ARM_INS_NOP:
@@ -598,24 +605,30 @@ class Function:
             raise Unsupported('instruction %s %s' % (ins.mnemonic, ins.op_str))
         return out
 
+    def tail_call(self, target, pc):
+        text = self.call(target, pc)
+        if text.startswith('CALL(') and text.endswith(');'):
+            return 'return %s;' % text[5:-2]
+        return text + ' RETURN();'
+
     def call(self, target, pc):
         im = self.im
         if target in im.stubs:
             name = im.stubs[target]
             IMPORTS.add(name)
             if name in NORETURN:
-                return 'SYNC(); imp%s(); return;' % name
-            return 'CALL(imp%s());' % name
+                return 'CALL_IMP(imp%s); return 0;' % name
+            return 'CALL_IMP(imp%s);' % name
         name = im.funcs.get(target)
         if name is None:
             raise Unsupported('call into the middle of a function: %x' % target)
         if name in OVERRIDES or name.startswith(OVERRIDE_PREFIXES):
             USED_OVERRIDES.add(name)
-            return 'CALL(ovr%s());' % name
+            return 'CALL_IMP(ovr%s);' % name
         if target not in WANTED:
             MISSING.add(name)
-            return 'CALL(rt_missing("%s"));' % name
-        return 'CALL(f_%x());' % target
+            return 'rt_missing("%s");' % name
+        return 'CALL(f_%x(r0, r1, r2, r3));' % target
 
     # ---- floating point -----------------------------------------------------------------
     def vfp(self, pc, ins):
@@ -797,6 +810,8 @@ class Function:
             load = m in (ARM_INS_VPOP, ARM_INS_VLDMIA, ARM_INS_VLDMDB)
             body = ['uint32_t ea = %s%s;' % (base, ' - %d' % total if down else '')]
             for i, name in enumerate(regs):
+                if m in (ARM_INS_VPUSH, ARM_INS_VPOP) and size == 8 and 8 <= int(name[1:]) <= 15:
+                    continue                        # preserved registers: as for push and pop
                 lv = self.dreg(name, 'q') if size == 8 else self.sreg(name, 'u')
                 acc = 'M64(ea + %d)' % (size * i) if size == 8 else 'M32(ea + %d)' % (size * i)
                 body.append('%s = %s;' % ((lv, acc) if load else (acc, lv)))
@@ -827,20 +842,20 @@ class Function:
             nxt = pc + 4
             if nxt not in self.ins and not self.ends_flow(ins, pc):
                 body.append('  rt_bad_jump(0x%xu);' % nxt)
-        core = sorted(self.used & {'r%d' % i for i in range(13)} | {'r0', 'r1', 'r2', 'r3', 'sp'}, key=lambda s: (len(s), s))
-        decl = []
-        for name in core:
-            init = {'r0': 'R0', 'r1': 'R1', 'r2': 'R2', 'r3': 'R3', 'sp': 'SP'}.get(name, '0')
-            decl.append('%s = %s' % (name, init))
+        core = sorted(self.used & {'r%d' % i for i in range(4, 13)}, key=lambda s: (len(s), s))
+        decl = ['%s = 0' % name for name in core]
         if 'lr' in self.used:
             decl.append('lr = 0')
-        lines = self.tables + ['void f_%x(void) { /* %s */' % (self.addr, self.name),
-                 '  uint32_t %s;' % ', '.join(decl),
-                 '  uint32_t n = 0, z = 0, c = 0, v = 0, fn = 0, fz = 0, fc = 0, fv = 0;']
+        lines = self.tables + ['uint64_t f_%x(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) { /* %s */' % (self.addr, self.name)]
+        if decl:
+            lines.append('  uint32_t %s;' % ', '.join(decl))
+        lines += ['  uint32_t n = 0, z = 0, c = 0, v = 0, fn = 0, fz = 0, fc = 0, fv = 0;']
         vregs = sorted((x for x in self.used if x[0] == 'd'), key=lambda s: int(s[1:]))
         if vregs:
             lines.append('  vreg %s;' % ', '.join('%s = {0}' % x for x in vregs))
         lines.append('  (void)n; (void)z; (void)c; (void)v; (void)fn; (void)fz; (void)fc; (void)fv; ENTER(0x%xu);' % self.addr)
+        if self.name in NOTIFY:
+            lines.append('  %s(r0);' % NOTIFY[self.name])
         lines += body
         lines.append('}')
         return '\n'.join(lines)
@@ -928,8 +943,9 @@ def main():
         sys.exit(1)
 
     count = sum(len(functions[a].ins) for a in texts)
-    header = ['/* Generated by tools/recomp.py from the original executable. Do not commit. */', '#include "rt.h"', '']
-    protos = ['void f_%x(void);' % a for a in sorted(texts)]
+    header = ['/* Generated by tools/recomp.py from the original executable. Do not commit. */', '#define RT_GENERATED 1',
+              '#include "rt.h"', '']
+    protos = ['uint64_t f_%x(uint32_t, uint32_t, uint32_t, uint32_t);' % a for a in sorted(texts)]
     protos += ['void imp%s(void);' % n for n in sorted(IMPORTS)]
     protos += ['void ovr%s(void);' % n for n in sorted(USED_OVERRIDES)]
     (out_dir / 'recomp.h').write_text('\n'.join(['/* Generated by tools/recomp.py. Do not commit. */'] + protos) + '\n')
@@ -938,7 +954,8 @@ def main():
     for p in range(parts):
         chunk = order[p * len(order) // parts:(p + 1) * len(order) // parts]
         (out_dir / ('recomp_%d.c' % p)).write_text('\n'.join(header + ['#include "recomp.h"', ''] + [texts[a] for a in chunk]) + '\n')
-    table = ['/* Generated by tools/recomp.py. Do not commit. */', '#include "rt.h"', '#include "recomp.h"', '',
+    table = ['/* Generated by tools/recomp.py. Do not commit. */', '#define RT_GENERATED 1', '#include "rt.h"',
+             '#include "recomp.h"', '',
              'const rt_func rt_functions[] = {']
     table += ['  { 0x%xu, f_%x },' % (a, a) for a in order]
     table += ['};', 'const int rt_function_count = %d;' % len(order), '',
@@ -952,6 +969,25 @@ def main():
     table.append('const uint8_t rt_literals[] = { %s };' % ', '.join('%d' % x for x in blob))
     table.append('const uint32_t rt_literals_size = %d;' % len(blob))
     table.append('')
+    table += ['/* A call through a pointer (virtual functions): find the translated function. */',
+              'uint64_t rt_call(uint32_t addr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {',
+              '    int lo = 0, hi = rt_function_count - 1;',
+              '    while (lo <= hi) {',
+              '        int mid = (lo + hi) / 2;',
+              '        if (rt_functions[mid].addr == addr) return rt_functions[mid].fn(r0, r1, r2, r3);',
+              '        if (rt_functions[mid].addr < addr) lo = mid + 1; else hi = mid - 1;',
+              '    }',
+              '    rt_bad_call(addr);',
+              '    return 0;',
+              '}', '',
+              '/* The way in from the port\'s own code. Where the stack pointer and memory base live in',
+              ' * reserved registers, the caller\'s values are put back afterwards. */',
+              'uint64_t rt_enter(uint32_t addr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {',
+              '    RT_ENTER_SAVE();',
+              '    uint64_t result = rt_call(addr, r0, r1, r2, r3);',
+              '    RT_ENTER_RESTORE();',
+              '    return result;',
+              '}', '']
     table.append('const rt_extern rt_externs[] = {')
     table += ['  { 0x%xu, "%s" },' % (a, n) for a, n in sorted(im.nonlazy.items())]
     table += ['};', 'const int rt_extern_count = %d;' % len(im.nonlazy)]
