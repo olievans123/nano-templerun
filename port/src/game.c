@@ -44,6 +44,27 @@ static float sTilt;
  * that display (1 on the phone, 2 on the iPad), which the shell sets for the panel's width. */
 #define DISPLAY_SCALE_OFFSET 0x10
 
+/* ---- the loading screen ----------------------------------------------------------------------
+ * The phone's launch picture, shown from the first frame (before the engine and its files are
+ * loaded, which takes a couple of seconds) until the title scene, with a bar that fills. */
+static unsigned sSplash;
+static void splash(float progress) {
+    if (!sSplash) return;
+    float w = (float)sW, h = (float)sH;
+    fe_overlay(sSplash, 0.0f, 0.0f, w, h, 0.0f, 0.0f, 1.0f, 1.0f, 0xffffffffu);
+    /* the bar: a dark slot and a gold filling, both cut from the picture's gold */
+    float bw = w * 0.6f, bx = (w - bw) * 0.5f, by = h * 0.885f, fill = (bw - 4.0f) * (progress < 0.0f ? 0.0f : progress > 1.0f ? 1.0f : progress);
+    fe_overlay(sSplash, bx, by, bw, 8.0f, 0.47f, 0.52f, 0.49f, 0.54f, 0xff101820u);
+    if (fill >= 3.0f) fe_overlay(sSplash, bx + 2.0f, by + 2.0f, fill, 4.0f, 0.47f, 0.52f, 0.49f, 0.54f, 0xffffffffu);
+}
+void game_splash(int panel_w, int panel_h, int draw) {
+    sW = panel_w; sH = panel_h;
+    if (!sSplash) { fe_reset(); sSplash = rt_host_load_texture("splash", "splash.png", 0); }
+    fe_frame_begin(sW, sH);
+    if (draw) splash(0.0f);
+    fe_frame_end();
+}
+
 static void load_records(void);
 int game_init(int panel_w, int panel_h, uint32_t heap_bytes, uint32_t seed) {
     sW = panel_w; sH = panel_h;
@@ -344,17 +365,16 @@ void game_frame(float dt) {
     plat_poll();
     CRUMB("clear");
     fe_frame_begin(sW, sH);
-    if (!sDrawing) return;
+    if (!sDrawing) { splash(0.04f); fe_frame_end(); return; }
     if (sWarm < TESTS * TEST_SPACING) {
-        /* The loading screen. The driver takes a texture's first draw badly when the frame
-         * holds much else: with the larger sheets of earlier builds the first scene frame
-         * rebooted the iPod whenever it was also the first use of two of them. So each texture
-         * is first drawn here, alone, as a dot in the bottom corner, a few frames apart; the
-         * screens' sheet goes first and the logo is up from then on. */
+        /* Still the loading screen. The driver takes a texture's first draw badly when the
+         * frame holds much else: with the larger sheets of earlier builds the first scene
+         * frame rebooted the iPod whenever it was also the first use of two of them. So each
+         * texture is first drawn here, alone, as a dot at the bottom edge, a few frames apart. */
         int step = sWarm / TEST_SPACING;
         if (sWarm % TEST_SPACING == 0) port_test_mark(step);
+        splash(0.08f + 0.92f * (float)(sWarm + 1) / (float)(TESTS * TEST_SPACING));
         if (sTest[step]) fe_overlay(sTest[step], 2.0f + 4.0f * (float)step, (float)sH - 5.0f, 3.0f, 3.0f, 0.4f, 0.4f, 0.6f, 0.6f, WHITE);
-        if (step >= 1) picture("logo", 0.0f, 12.0f * (float)sW / 320.0f, (float)sW, WHITE);
         sWarm++;
         fe_frame_end();
         return;

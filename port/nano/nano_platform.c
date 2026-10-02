@@ -320,18 +320,29 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     }
     previous_frame=frame;
     if(!initialized) {
-        uint64_t t0=plat_time_us();
-        plat_log("Temple Run: panel %dx%d, heap free %u, largest %u, redraw %s",w,h,hb_os_heap_free(),
-                 hb_os_heap_largest(),tr_fast_redraw?"2 ms heartbeat":"16 ms heartbeat");
-        {   /* the previous run's trail, if it ended in a reboot: kept under a new name each time */
-            char trail[64];int n=0;
-            for(;n<9;n++){snprintf(trail,sizeof trail,DATA_DIR "/prevboot-%d.txt",n);if(!hb_fs_size(trail))break;}
-            snprintf(trail,sizeof trail,"prevboot-%d.txt",n);
-            save_previous_crumbs(trail);
+        static int prepared,splash_frames;
+        if(!prepared) {
+            prepared=1;
+            plat_log("Temple Run: panel %dx%d, heap free %u, largest %u, redraw %s",w,h,hb_os_heap_free(),
+                     hb_os_heap_largest(),tr_fast_redraw?"2 ms heartbeat":"16 ms heartbeat");
+            {   /* the previous run's trail, if it ended in a reboot: kept under a new name each time */
+                char trail[64];int n=0;
+                for(;n<9;n++){snprintf(trail,sizeof trail,DATA_DIR "/prevboot-%d.txt",n);if(!hb_fs_size(trail))break;}
+                snprintf(trail,sizeof trail,"prevboot-%d.txt",n);
+                save_previous_crumbs(trail);
+            }
+            port_crumb("init",0,0);
+            if(manifest()){plat_log("files.lst is missing");flush_log();failed=1;fatal_armed=0;return;}
         }
-        port_crumb("init",0,0);
+        /* The loading picture goes up before the two seconds of loading: its texture in the
+         * first frame, drawn in the next two, and it stays on the panel while the rest loads. */
+        if(splash_frames<3) {
+            port_crumb("splash",(uint32_t)splash_frames,0);
+            game_splash(w,h,splash_frames>0);
+            splash_frames++;fatal_armed=0;return;
+        }
+        uint64_t t0=plat_time_us();
         uint32_t marker=0;void *flag=NULL;
-        if(manifest()){plat_log("files.lst is missing");flush_log();failed=1;fatal_armed=0;return;}
         flag=plat_read_file("autopilot.txt",&marker,1);
         if(flag){free(flag);game_autopilot(1);plat_log("autopilot on");}
         port_crumb("heap0",hb_os_heap_free(),0);
@@ -375,6 +386,9 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
 
     /* The first frames after the textures go up only clear the screen. */
     game_set_drawing(count>=4);
+    /* One frame in sixteen is given to GL the old way, each triangle with its own vertices,
+     * so the log can say what the indexed draws save on this driver. */
+    fe_option_indexed=(count&15u)!=15u;
     port_crumb("heap",hb_os_heap_free(),hb_os_heap_largest());
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();
@@ -388,8 +402,9 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     if(period>perf.max_period)perf.max_period=period;
     if(work>perf.max_work)perf.max_work=work;
     perf.over40+=period>40000u;
-    static uint32_t most_triangles,trimmed_frames,trimmed;static uint64_t vertex_us,boxed;
-    vertex_us+=fe_time_vertex_us;boxed+=(uint32_t)fe_stat_box_culled;
+    static uint32_t most_triangles,trimmed_frames,trimmed,array_frames;static uint64_t vertex_us,boxed,vertices_out,submit_indexed,submit_arrays;
+    vertex_us+=fe_time_vertex_us;boxed+=(uint32_t)fe_stat_box_culled;vertices_out+=(uint32_t)fe_stat_vertices_out;
+    if(fe_option_indexed)submit_indexed+=fe_time_submit_us;else {submit_arrays+=fe_time_submit_us;array_frames++;}
     if((uint32_t)fe_stat_triangles_out>most_triangles)most_triangles=(uint32_t)fe_stat_triangles_out;
     if(fe_stat_trimmed){trimmed_frames++;trimmed+=(uint32_t)fe_stat_trimmed;}
     (void)t1;
@@ -407,15 +422,21 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     if(reports<8 && seconds>=marks[reports] && perf.frames) {
         reports++;
         uint32_t fps10=perf.period?(uint32_t)((uint64_t)perf.frames*10000000u/perf.period):0;
-        plat_log("%u s: %u frames, %u.%u fps, work %u us = simulate %u + draw %u (transform %u) + submit %u (first call %u); max work %u, max period %u, over 40 ms %u",
+        plat_log("%u s: %u frames, %u.%u fps, work %u us = simulate %u + draw %u (transform %u, vertices %u) + submit %u (first %u); max work %u, max period %u, over 40 ms %u",
                  (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),
-                 (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),
+                 (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(vertex_us/perf.frames),(unsigned)(perf.submit/perf.frames),
                  (unsigned)(perf.first/perf.frames),perf.max_work,perf.max_period,perf.over40);
-        plat_log("  per frame %u vertices in (vertex part %u us; %u more left out by box), %u triangles out (most %u; %u left out in %u frames), %u draws; dropped %u; state %d, distance %d, best %d, presses %u (mailbox %u, list %u, mailbox stale %u, lifts by list %u, most entries %u); heap free %u, engine heap %u",
-                 perf.vertices/perf.frames,(unsigned)(vertex_us/perf.frames),(unsigned)(boxed/perf.frames),perf.triangles/perf.frames,(unsigned)most_triangles,(unsigned)trimmed,(unsigned)trimmed_frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),game_best(),
-                 (unsigned)touch_presses,(unsigned)touch_from_mailbox,(unsigned)touch_from_list,(unsigned)touch_stale,(unsigned)touch_lifts,(unsigned)touch_nodes_most,hb_os_heap_free(),(unsigned)rt_heap_peak());
+        plat_log("  in %u vertices (+%u boxed); out %u triangles, %u vertices (most %u triangles; %u left out in %u frames), %u draws; dropped %u",
+                 perf.vertices/perf.frames,(unsigned)(boxed/perf.frames),perf.triangles/perf.frames,(unsigned)(vertices_out/perf.frames),
+                 (unsigned)most_triangles,(unsigned)trimmed,(unsigned)trimmed_frames,perf.draws/perf.frames,perf.dropped);
+        plat_log("  submit indexed %u us, arrays %u us (%u frames); state %d, distance %d, best %d",
+                 (unsigned)(perf.frames>array_frames?submit_indexed/(perf.frames-array_frames):0),(unsigned)(array_frames?submit_arrays/array_frames:0),
+                 (unsigned)array_frames,game_state(),game_distance(),game_best());
+        plat_log("  presses %u (mailbox %u, list %u, stale %u, lifts %u, entries %u); heap free %u, engine heap %u",
+                 (unsigned)touch_presses,(unsigned)touch_from_mailbox,(unsigned)touch_from_list,(unsigned)touch_stale,(unsigned)touch_lifts,
+                 (unsigned)touch_nodes_most,hb_os_heap_free(),(unsigned)rt_heap_peak());
         flush_log();
-        memset(&perf,0,sizeof perf);most_triangles=trimmed=trimmed_frames=0;vertex_us=boxed=0;
+        memset(&perf,0,sizeof perf);most_triangles=trimmed=trimmed_frames=array_frames=0;vertex_us=boxed=vertices_out=submit_indexed=submit_arrays=0;
         last=0;
     }
     previous_end=plat_time_us();

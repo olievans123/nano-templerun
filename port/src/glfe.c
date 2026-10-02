@@ -231,17 +231,23 @@ void fe_delete_textures(uint32_t count, const uint32_t *names) { (void)count; (v
 
 /* ---- the frame's output ------------------------------------------------------------------ */
 typedef struct { float x, y, z, w, u0, v0, u1, v1; uint32_t color; } OutVtx;   /* what GL is given */
-#define CHUNK_VERTS 384                 /* one draw call; a multiple of 3 */
-#define CHUNKS 36
+/* The frame is kept as indexed triangles: a vertex shared by several triangles is stored and
+ * given to GL once (the engine's models share each vertex between about two of the triangles
+ * that are kept, and the driver's time goes by the vertex). A chunk is one draw call: up to
+ * 384 vertices and the corners of up to 256 triangles, as positions in the pool. */
+#define CHUNK_VERTS 384
+#define CHUNK_INDICES 768
+#define CHUNKS 32
 #define BATCHES 48
-#define BATCH_CHUNKS 36
+#define BATCH_CHUNKS 32
 enum { OPAQUE, FOGGED, ORDERED };
 typedef struct {
     unsigned tex0, tex1;
     uint8_t kind, blend, depth_test, depth_mask, chunks, chunk[BATCH_CHUNKS];
-    int last;                           /* vertices in the newest chunk */
 } Batch;
 static OutVtx sPool[CHUNKS * CHUNK_VERTS];
+static uint16_t sIndex[CHUNKS][CHUNK_INDICES];
+static uint16_t sChunkVerts[CHUNKS], sChunkIndices[CHUNKS];
 static Batch sBatches[BATCHES];
 static int sBatchCount, sChunksUsed, sOrderedOpen = -1;
 static float sHalfW = 120.0f, sHalfH = 216.0f;
@@ -263,6 +269,7 @@ float fe_option_min_area2 = 4.0f;
  * and the most seen is 2,300. */
 int fe_option_budget = 1300;
 int fe_option_box_cull = 1;
+int fe_option_indexed = 1;              /* give GL indexed triangles (1) or, as earlier builds did, each triangle's own three vertices (0) */
 int fe_stat_box_culled;                 /* this frame: vertices in models left out by their box */
 unsigned fe_time_vertex_us;             /* this frame: the vertex half of the transform time */
 int fe_stat_trimmed, fe_stat_cut;       /* this frame: triangles left out for the budget, and the level (see showing) of the last of them */
@@ -287,7 +294,6 @@ static Batch *batch_for(int kind, unsigned tex0, unsigned tex1, int blend, int d
     b->kind = (uint8_t)kind; b->tex0 = tex0; b->tex1 = tex1;
     b->blend = (uint8_t)blend; b->depth_test = (uint8_t)depth_test; b->depth_mask = (uint8_t)depth_mask;
     b->chunks = 0;
-    b->last = CHUNK_VERTS;              /* forces a first chunk */
     if (kind == ORDERED) sOrderedOpen = sBatchCount;
     sBatchCount++;
     if (sBatchCount > fe_peak_batches) fe_peak_batches = sBatchCount;
@@ -295,18 +301,20 @@ static Batch *batch_for(int kind, unsigned tex0, unsigned tex1, int blend, int d
 }
 
 int fe_stat_idle_calls, fe_stat_idle_vertices, fe_stat_idle_offscreen;    /* draw calls that gave no triangle, their vertices, and those wholly off one side */
-static int sFrameCount;                 /* triangles reserved this frame */
-static OutVtx *reserve(Batch *b) {
-    sFrameCount++;
-    if (b->last + 3 > CHUNK_VERTS) {
-        if (sChunksUsed == CHUNKS || b->chunks == BATCH_CHUNKS) { fe_stat_dropped++; return NULL; }
-        b->chunk[b->chunks++] = (uint8_t)sChunksUsed++;
-        if (sChunksUsed > fe_peak_chunks) fe_peak_chunks = sChunksUsed;
-        b->last = 0;
+static int sFrameCount;                 /* triangles kept this frame */
+/* The batch's newest chunk if it has room for this many more vertices and corners, else a
+ * new one; -1 when the frame is full. */
+static int chunk_for(Batch *b, int verts, int indices) {
+    if (b->chunks) {
+        int c = b->chunk[b->chunks - 1];
+        if (sChunkVerts[c] + verts <= CHUNK_VERTS && sChunkIndices[c] + indices <= CHUNK_INDICES) return c;
     }
-    OutVtx *v = &sPool[b->chunk[b->chunks - 1] * CHUNK_VERTS + b->last];
-    b->last += 3;
-    return v;
+    if (sChunksUsed == CHUNKS || b->chunks == BATCH_CHUNKS) { fe_stat_dropped++; return -1; }
+    int c = sChunksUsed++;
+    b->chunk[b->chunks++] = (uint8_t)c;
+    sChunkVerts[c] = sChunkIndices[c] = 0;
+    if (sChunksUsed > fe_peak_chunks) fe_peak_chunks = sChunksUsed;
+    return c;
 }
 
 /* ---- transform, clip, cull ----------------------------------------------------------------- */
@@ -395,6 +403,71 @@ static Buffer *packed_buffer(const Array *a) {
 }
 
 static uint64_t sDrawStart;
+/* What a vertex needs beyond its place on the screen: texture coordinates, colour, fog. Most
+ * of the vertices the engine sends are only in triangles that face away, are off the screen
+ * or cover under two pixels, so this half is done when a triangle is kept, for its corners
+ * (about one vertex in four). */
+typedef struct {
+    const int16_t *pk;
+    const uint8_t *uv0, *uv1, *col;
+    int pks, pk0, pk1, t0s, t1s, cs, fog_blend;
+    float us0, us1, tu0, tv0, tu1, tv1;
+    uint32_t flat;
+} Finish;
+static uint8_t sDone[MAX_VERTS], sLost[MAX_VERTS];
+static float sFogFactor[MAX_VERTS];                   /* how much shows through the fog: 1 clear, 0 none */
+static inline void finish(const Finish *f, unsigned i) {
+    if (sDone[i]) return;
+    sDone[i] = 1;
+    OutVtx *o = &sOut[i];
+    if (f->pk) {
+        const int16_t *q = f->pk + (size_t)i * (size_t)f->pks;
+        if (f->pk0 >= 0) { o->u0 = (float)q[3 + 2 * f->pk0] * f->us0 + f->tu0; o->v0 = (float)q[4 + 2 * f->pk0] * f->us0 + f->tv0; }
+        if (f->pk1 >= 0) { o->u1 = (float)q[3 + 2 * f->pk1] * f->us1 + f->tu1; o->v1 = (float)q[4 + 2 * f->pk1] * f->us1 + f->tv1; }
+    }
+    if (f->uv0) { float t[2]; __builtin_memcpy(t, f->uv0 + (size_t)i * (size_t)f->t0s, 8); o->u0 = t[0] + f->tu0; o->v0 = t[1] + f->tv0; }
+    else if (f->pk0 < 0) o->u0 = o->v0 = 0.f;
+    if (f->uv1) { float t[2]; __builtin_memcpy(t, f->uv1 + (size_t)i * (size_t)f->t1s, 8); o->u1 = t[0] + f->tu1; o->v1 = t[1] + f->tv1; }
+    else if (f->pk1 < 0) o->u1 = o->v1 = 0.f;
+    uint32_t c = f->flat;
+    if (f->col) __builtin_memcpy(&c, f->col + (size_t)i * (size_t)f->cs, 4);
+    uint8_t fogged = 0;
+    if (f->fog_blend) {
+        float v = sFogFactor[i];
+        if (v < 0.998f) {                               /* colour and alpha scaled by the fog factor */
+            uint32_t k = v <= 0.f ? 0u : (uint32_t)(v * 256.f);
+            c = ((c & 0x00ff00ffu) * k >> 8 & 0x00ff00ffu) | ((c >> 8 & 0x00ff00ffu) * k & 0xff00ff00u);
+            fogged = 1;
+        }
+    }
+    o->color = c;
+    sFogged[i] = fogged;
+}
+
+/* Where each vertex of the draw call in hand already is in the pool, for the triangles going
+ * to its plain batch and to its fogged one; a place in a chunk that has since been closed
+ * does not count. */
+#define NO_SLOT 0xffffu
+static uint16_t sSlot[2][MAX_VERTS];
+static inline void emit(Batch *bt, uint16_t *slot, unsigned ia, unsigned ib, unsigned ic) {
+    int c = chunk_for(bt, 3, 3);
+    if (c < 0) return;
+    const unsigned corner[3] = { ia, ib, ic };
+    uint16_t *index = &sIndex[c][sChunkIndices[c]];
+    const unsigned base = (unsigned)c * CHUNK_VERTS;
+    for (int k = 0; k < 3; k++) {
+        unsigned p = slot[corner[k]];
+        if (p - base >= CHUNK_VERTS) {                  /* not in this chunk (NO_SLOT is in none) */
+            p = base + sChunkVerts[c]++;
+            sPool[p] = sOut[corner[k]];
+            slot[corner[k]] = (uint16_t)p;
+        }
+        index[k] = (uint16_t)p;
+    }
+    sChunkIndices[c] += 3;
+    sFrameCount++;
+}
+
 static void draw_triangles(int count, const uint16_t *idx, int first) {
     fe_stat_calls++;
     Buffer *packed = sVertexArray.enabled ? packed_buffer(&sVertexArray) : NULL;
@@ -408,29 +481,30 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
     if (packed && sVertexArray.pointer / packed->stride + (uint32_t)n > packed->size / packed->stride) return;
 
     DrawState s;
+    Finish fin;
     s.plain = s.fogged = NULL;
     s.tex0 = sTexEnabled[0] ? rt_texture_host(sTexBound[0]) : 0;
-    const uint8_t *uv0 = s.tex0 && sTexCoordArray[0].enabled ? array_base(&sTexCoordArray[0]) : NULL;
-    const uint8_t *uv1 = sTexEnabled[1] && sTexCoordArray[1].enabled ? array_base(&sTexCoordArray[1]) : NULL;
+    fin.uv0 = s.tex0 && sTexCoordArray[0].enabled ? array_base(&sTexCoordArray[0]) : NULL;
+    fin.uv1 = sTexEnabled[1] && sTexCoordArray[1].enabled ? array_base(&sTexCoordArray[1]) : NULL;
     /* a packed buffer holds the texture coordinates too: which of its pairs each unit reads */
-    int pk0 = -1, pk1 = -1;
-    const int16_t *pk = NULL;
+    fin.pk0 = fin.pk1 = -1;
+    fin.pk = NULL;
     if (packed) {
         uint32_t base = sVertexArray.pointer / packed->stride;
         if (sVertexArray.pointer % packed->stride || (int)packed->stride != sVertexArray.stride) return;
-        pk = (const int16_t *)(const void *)packed->data + (size_t)base * (packed->packed_stride / 2);
+        fin.pk = (const int16_t *)(const void *)packed->data + (size_t)base * (packed->packed_stride / 2);
         for (int u = 0; u < 2; u++) {
             const Array *t = &sTexCoordArray[u];
             if (!t->enabled || t->buffer != sVertexArray.buffer || t->pointer < sVertexArray.pointer) continue;
             uint32_t rel = t->pointer - sVertexArray.pointer;
-            if (rel == 12 || (rel == 20 && packed->channels > 1)) { if (u == 0) pk0 = rel == 12 ? 0 : 1; else pk1 = rel == 12 ? 0 : 1; }
+            if (rel == 12 || (rel == 20 && packed->channels > 1)) { if (u == 0) fin.pk0 = rel == 12 ? 0 : 1; else fin.pk1 = rel == 12 ? 0 : 1; }
         }
-        if (!s.tex0) pk0 = -1;
-        if (!sTexEnabled[1]) pk1 = -1;
+        if (!s.tex0) fin.pk0 = -1;
+        if (!sTexEnabled[1]) fin.pk1 = -1;
     }
-    s.tex1 = (uv1 || pk1 >= 0) ? rt_texture_host(sTexBound[1]) : 0;
-    if (!s.tex1) { uv1 = NULL; pk1 = -1; }
-    const uint8_t *col = sColorArray.enabled ? array_base(&sColorArray) : NULL;
+    s.tex1 = (fin.uv1 || fin.pk1 >= 0) ? rt_texture_host(sTexBound[1]) : 0;
+    if (!s.tex1) { fin.uv1 = NULL; fin.pk1 = -1; }
+    fin.col = sColorArray.enabled ? array_base(&sColorArray) : NULL;
     s.fogged_scene = sFog && !sBlend && sDepthTest && sDepthMask;
     s.cull = sCull;
     /* The driver reboots on small triangles: with two texture units (found with the test
@@ -441,18 +515,23 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
     float m[16];
     const float *mv = sModelView[sModelViewTop];
     multiply(m, sProjection[sProjectionTop], mv);
-    const float tu0 = sTexture[0][sTextureTop[0]][12], tv0 = sTexture[0][sTextureTop[0]][13];
-    const float tu1 = sTexture[1][sTextureTop[1]][12], tv1 = sTexture[1][sTextureTop[1]][13];
+    fin.tu0 = sTexture[0][sTextureTop[0]][12]; fin.tv0 = sTexture[0][sTextureTop[0]][13];
+    fin.tu1 = sTexture[1][sTextureTop[1]][12]; fin.tv1 = sTexture[1][sTextureTop[1]][13];
     const int fog = sFog && sFogEnd > sFogStart, fog_blend = fog && s.fogged_scene && fe_option_fog_blend;
     const float fog_scale = fog ? 1.0f / (sFogEnd - sFogStart) : 0.0f;
     const float f2 = mv[2], f6 = mv[6], f10 = mv[10], f14 = mv[14], fog_end = sFogEnd;
-    const int vs = sVertexArray.stride ? sVertexArray.stride : 12, cs = sColorArray.stride ? sColorArray.stride : 4;
-    const int t0s = sTexCoordArray[0].stride ? sTexCoordArray[0].stride : 8, t1s = sTexCoordArray[1].stride ? sTexCoordArray[1].stride : 8;
+    /* with the usual perspective the depth the fog goes by is the w just computed */
+    const int depth_is_w = m[3] == -f2 && m[7] == -f6 && m[11] == -f10 && m[15] == -f14;
+    const int vs = sVertexArray.stride ? sVertexArray.stride : 12;
+    fin.cs = sColorArray.stride ? sColorArray.stride : 4;
+    fin.t0s = sTexCoordArray[0].stride ? sTexCoordArray[0].stride : 8; fin.t1s = sTexCoordArray[1].stride ? sTexCoordArray[1].stride : 8;
     const int pks = packed ? packed->packed_stride / 2 : 0;
+    fin.pks = pks;
     const float ps = packed ? packed->pos_scale : 0.f;
-    const float us0 = packed && pk0 >= 0 ? packed->uv_scale[pk0] : 0.f, us1 = packed && pk1 >= 0 ? packed->uv_scale[pk1] : 0.f;
-    const uint32_t flat = byte_of(sColor[0] * 255.f) | byte_of(sColor[1] * 255.f) << 8 | byte_of(sColor[2] * 255.f) << 16
-                          | byte_of(sColor[3] * 255.f) << 24;
+    fin.us0 = packed && fin.pk0 >= 0 ? packed->uv_scale[fin.pk0] : 0.f; fin.us1 = packed && fin.pk1 >= 0 ? packed->uv_scale[fin.pk1] : 0.f;
+    fin.flat = byte_of(sColor[0] * 255.f) | byte_of(sColor[1] * 255.f) << 8 | byte_of(sColor[2] * 255.f) << 16
+               | byte_of(sColor[3] * 255.f) << 24;
+    fin.fog_blend = fog_blend;
     const float hw = sHalfW, hh = sHalfH;
     if (packed && fe_option_box_cull) {
         /* The model's box first: if its eight corners are all off the same side of the view,
@@ -474,15 +553,15 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
         }
         if (off || (fog_blend && sign != 3 && nearest > fog_end * 1.001f)) { fe_stat_box_culled += n; return; }
     }
+    const int start = idx ? 0 : first;
+    const int16_t *pk = fin.pk;
     uint8_t all = 0xff;
-    for (int i = idx ? 0 : first; i < n; i++) {
+    for (int i = start; i < n; i++) {
         float x, y, z;
         OutVtx *o = &sOut[i];
         if (packed) {
             const int16_t *q = pk + (size_t)i * (size_t)pks;
             x = (float)q[0] * ps; y = (float)q[1] * ps; z = (float)q[2] * ps;
-            if (pk0 >= 0) { o->u0 = (float)q[3 + 2 * pk0] * us0 + tu0; o->v0 = (float)q[4 + 2 * pk0] * us0 + tv0; }
-            if (pk1 >= 0) { o->u1 = (float)q[3 + 2 * pk1] * us1 + tu1; o->v1 = (float)q[4 + 2 * pk1] * us1 + tv1; }
         } else {
             float p[3];
             __builtin_memcpy(p, pos + (size_t)i * (size_t)vs, 12);
@@ -491,24 +570,14 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
         float cx = m[0] * x + m[4] * y + m[8] * z + m[12], cy = m[1] * x + m[5] * y + m[9] * z + m[13];
         float cz = m[2] * x + m[6] * y + m[10] * z + m[14], cw = m[3] * x + m[7] * y + m[11] * z + m[15];
         o->x = cx; o->y = cy; o->z = cz; o->w = cw;
-        if (uv0) { float t[2]; __builtin_memcpy(t, uv0 + (size_t)i * (size_t)t0s, 8); o->u0 = t[0] + tu0; o->v0 = t[1] + tv0; }
-        else if (pk0 < 0) o->u0 = o->v0 = 0.f;
-        if (uv1) { float t[2]; __builtin_memcpy(t, uv1 + (size_t)i * (size_t)t1s, 8); o->u1 = t[0] + tu1; o->v1 = t[1] + tv1; }
-        else if (pk1 < 0) o->u1 = o->v1 = 0.f;
-        uint32_t c = flat;
-        if (col) __builtin_memcpy(&c, col + (size_t)i * (size_t)cs, 4);
-        uint8_t fogged = 0;
+        uint8_t lost = 0;
         if (fog_blend) {
-            float ez = f2 * x + f6 * y + f10 * z + f14;
+            float ez = depth_is_w ? cw : f2 * x + f6 * y + f10 * z + f14;
             float f = (fog_end - (ez < 0.f ? -ez : ez)) * fog_scale;
-            if (f < 0.998f) {                           /* colour and alpha scaled by the fog factor */
-                uint32_t k = f <= 0.f ? 0u : (uint32_t)(f * 256.f);
-                c = ((c & 0x00ff00ffu) * k >> 8 & 0x00ff00ffu) | ((c >> 8 & 0x00ff00ffu) * k & 0xff00ff00u);
-                fogged = k < 2 ? 2 : 1;                 /* 2: lost in the fog */
-            }
+            sFogFactor[i] = f;
+            if (f < 0.0078125f) lost = 2;               /* under 2/256: lost in the fog */
         }
-        o->color = c;
-        sFogged[i] = fogged;
+        sLost[i] = lost;
         float e = cw * INSET;
         uint8_t code = (uint8_t)((cx < -e) | (cx > e) << 1 | (cy < -e) << 2 | (cy > e) << 3 | (cz < -e) << 4 | (cz > e) << 5);
         sCode[i] = code;
@@ -523,6 +592,9 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
     fe_stat_triangles_in += count / 3;
     fe_time_vertex_us += (unsigned)(plat_time_us() - sDrawStart);
     if (all) { fe_stat_idle_offscreen += n; return; }   /* the whole mesh is off one side */
+    memset(sDone + start, 0, (size_t)(n - start));
+    memset(sSlot[0] + start, 0xff, (size_t)(n - start) * 2);
+    memset(sSlot[1] + start, 0xff, (size_t)(n - start) * 2);
     const int cull = s.cull;
     const float min_area2 = s.min_area2;
     for (int i = 0; i + 2 < count; i += 3) {
@@ -530,23 +602,24 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
                  ic = idx ? idx[i + 2] : (unsigned)(first + i + 2);
         uint8_t ca = sCode[ia], cb = sCode[ib], cc = sCode[ic];
         if (ca & cb & cc) continue;
-        uint8_t fa = sFogged[ia], fb = sFogged[ib], fc = sFogged[ic];
-        if (fa & fb & fc & 2) continue;                 /* lost in the fog */
-        int fogged = (fa | fb | fc) != 0;
+        if (sLost[ia] & sLost[ib] & sLost[ic]) continue;        /* lost in the fog */
         if (!(ca | cb | cc)) {
             float ax = sSX[ia], ay = sSY[ia];
             float area2 = (sSX[ib] - ax) * (sSY[ic] - ay) - (sSX[ic] - ax) * (sSY[ib] - ay);    /* pixels, y up */
             if (cull && area2 >= 0.f) continue;         /* front faces are clockwise */
             if (area2 < 0.f) area2 = -area2;
             if (!drawable(ax, ay, sSX[ib], sSY[ib], sSX[ic], sSY[ic], area2, min_area2)) { fe_stat_tiny++; continue; }
+            finish(&fin, ia); finish(&fin, ib); finish(&fin, ic);
+            int fogged = (sFogged[ia] | sFogged[ib] | sFogged[ic]) != 0;
             Batch *bt = target(&s, fogged);
-            OutVtx *v = bt ? reserve(bt) : NULL;
-            if (!v) continue;
-            v[0] = sOut[ia]; v[1] = sOut[ib]; v[2] = sOut[ic];
+            if (!bt) continue;
+            emit(bt, sSlot[fogged], ia, ib, ic);
             fe_stat_fogged += fogged;
             continue;
         }
         /* crosses the edge of the view: clip to every plane it crosses */
+        finish(&fin, ia); finish(&fin, ib); finish(&fin, ic);
+        int fogged = (sFogged[ia] | sFogged[ib] | sFogged[ic]) != 0;
         Vtx bufa[10], bufb[10], *in = bufa, *out = bufb;
         uint8_t any = ca | cb | cc;
         int k = 3;
@@ -565,21 +638,35 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
             sx[j] = in[j].x * inv * hw;
             sy[j] = in[j].y * inv * hh;
         }
+        int chunk = -1;                                 /* the polygon's corners go in once, as its triangles need them */
+        uint16_t at[10];
         for (int j = 1; j + 1 < k; j++) {
             float area2 = (sx[j] - sx[0]) * (sy[j + 1] - sy[0]) - (sx[j + 1] - sx[0]) * (sy[j] - sy[0]);
             if (cull && area2 >= 0.f) continue;
             if (area2 < 0.f) area2 = -area2;
             if (!drawable(sx[0], sy[0], sx[j], sy[j], sx[j + 1], sy[j + 1], area2, min_area2)) { fe_stat_tiny++; continue; }
-            Batch *bt = target(&s, fogged);
-            OutVtx *v = bt ? reserve(bt) : NULL;
-            if (!v) continue;
-            const Vtx *tri[3] = { &in[0], &in[j], &in[j + 1] };
-            for (int t = 0; t < 3; t++) {
-                const Vtx *p = tri[t];
-                v[t].x = p->x; v[t].y = p->y; v[t].z = p->z; v[t].w = p->w;
-                v[t].u0 = p->u0; v[t].v0 = p->v0; v[t].u1 = p->u1; v[t].v1 = p->v1;
-                v[t].color = byte_of(p->r) | byte_of(p->g) << 8 | byte_of(p->b) << 16 | byte_of(p->a) << 24;
+            if (chunk < 0) {
+                Batch *bt = target(&s, fogged);
+                chunk = bt ? chunk_for(bt, k, (k - 2) * 3) : -1;
+                if (chunk < 0) break;
+                for (int t = 0; t < k; t++) at[t] = NO_SLOT;
             }
+            const int corner[3] = { 0, j, j + 1 };
+            uint16_t *index = &sIndex[chunk][sChunkIndices[chunk]];
+            for (int t = 0; t < 3; t++) {
+                int c = corner[t];
+                if (at[c] == NO_SLOT) {
+                    const Vtx *p = &in[c];
+                    at[c] = (uint16_t)(chunk * CHUNK_VERTS + sChunkVerts[chunk]++);
+                    OutVtx *v = &sPool[at[c]];
+                    v->x = p->x; v->y = p->y; v->z = p->z; v->w = p->w;
+                    v->u0 = p->u0; v->v0 = p->v0; v->u1 = p->u1; v->v1 = p->v1;
+                    v->color = byte_of(p->r) | byte_of(p->g) << 8 | byte_of(p->b) << 16 | byte_of(p->a) << 24;
+                }
+                index[t] = at[c];
+            }
+            sChunkIndices[chunk] += 3;
+            sFrameCount++;
             fe_stat_fogged += fogged;
         }
     }
@@ -622,20 +709,24 @@ void fe_overlay(unsigned texture, float x, float y, float w, float h, float u0, 
     if (t > INSET) { v0 += (INSET - t) * dv; t = INSET; }
     if (bt < -INSET) { v1 -= (-INSET - bt) * dv; bt = -INSET; }
     if (!(r > l) || !(t > bt)) return;
-    const float corner[6][4] = { { l, t, u0, v0 }, { r, t, u1, v0 }, { r, bt, u1, v1 }, { l, t, u0, v0 }, { r, bt, u1, v1 }, { l, bt, u0, v1 } };
-    for (int half = 0; half < 2; half++) {
-        OutVtx *v = reserve(b);
-        if (!v) return;
-        for (int k = 0; k < 3; k++) {
-            const float *c = corner[half * 3 + k];
-            v[k].x = c[0]; v[k].y = c[1]; v[k].z = 0.f; v[k].w = 1.f;
-            v[k].u0 = c[2]; v[k].v0 = c[3]; v[k].u1 = v[k].v1 = 0.f;
-            v[k].color = rgba;
-        }
+    const float corner[4][4] = { { l, t, u0, v0 }, { r, t, u1, v0 }, { r, bt, u1, v1 }, { l, bt, u0, v1 } };
+    int c = chunk_for(b, 4, 6);
+    if (c < 0) return;
+    unsigned first = (unsigned)c * CHUNK_VERTS + sChunkVerts[c];
+    for (int k = 0; k < 4; k++) {
+        OutVtx *v = &sPool[first + (unsigned)k];
+        v->x = corner[k][0]; v->y = corner[k][1]; v->z = 0.f; v->w = 1.f;
+        v->u0 = corner[k][2]; v->v0 = corner[k][3]; v->u1 = v->v1 = 0.f;
+        v->color = rgba;
     }
+    static const uint8_t order[6] = { 0, 1, 2, 0, 2, 3 };
+    uint16_t *index = &sIndex[c][sChunkIndices[c]];
+    for (int k = 0; k < 6; k++) index[k] = (uint16_t)(first + order[k]);
+    sChunkVerts[c] += 4;
+    sChunkIndices[c] += 6;
+    sFrameCount += 2;
 }
 
-/* ---- frame ------------------------------------------------------------------------------- */
 void fe_frame_begin(int panel_w, int panel_h) {
     sHalfW = (float)panel_w * 0.5f;
     sHalfH = (float)panel_h * 0.5f;
@@ -661,6 +752,9 @@ void fe_frame_begin(int panel_w, int panel_h) {
     glShadeModel(GL_SMOOTH);
 }
 
+static int sSpare;                      /* the next unused place in the pool, for draws without indices */
+int fe_stat_vertices_out;               /* this frame: vertices GL was given */
+long fe_host_vertices;                  /* host: vertices given to GL, all frames */
 static void draw_batch(const Batch *b, int index) {
     plat_poll();
     CRUMB("batch", (uint32_t)(index << 16) | (uint32_t)(b->tex1 ? 2 : 1) | (uint32_t)b->kind << 8);
@@ -689,35 +783,48 @@ static void draw_batch(const Batch *b, int index) {
     if (b->depth_test) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     glDepthMask(b->depth_mask ? GL_TRUE : GL_FALSE);
     for (int k = 0; k < b->chunks; k++) {
-        int n = k + 1 == b->chunks ? b->last : CHUNK_VERTS;
+        int c = b->chunk[k], n = sChunkIndices[c];
         if (!n) continue;
-        CRUMB("arrays", (uint32_t)(b->chunk[k] << 16) | (uint32_t)n);
-        if (!fe_stat_draws) {
-            uint64_t t0 = plat_time_us();
-            glDrawArrays(GL_TRIANGLES, b->chunk[k] * CHUNK_VERTS, n);
-            fe_time_first_draw_us = (unsigned)(plat_time_us() - t0);
-        } else
-        glDrawArrays(GL_TRIANGLES, b->chunk[k] * CHUNK_VERTS, n);
-        fe_stat_draws++;
+        uint64_t t0 = fe_stat_draws ? 0 : plat_time_us();
+        if (fe_option_indexed) {
+            CRUMB("elements", (uint32_t)(c << 16) | (uint32_t)n);
+            glDrawElements(GL_TRIANGLES, n, GL_UNSIGNED_SHORT, sIndex[c]);
+            fe_stat_draws++;
+            fe_stat_vertices_out += sChunkVerts[c];
+        } else {
+            /* each triangle's own three vertices, written out in the part of the pool the
+             * frame has not used, 384 to a call */
+            for (int from = 0; from < n; from += CHUNK_VERTS) {
+                int part = n - from < CHUNK_VERTS ? n - from : CHUNK_VERTS;
+                if (sSpare + part > CHUNKS * CHUNK_VERTS) { fe_stat_dropped++; break; }
+                OutVtx *out = &sPool[sSpare];
+                for (int j = 0; j < part; j++) out[j] = sPool[sIndex[c][from + j]];
+                CRUMB("arrays", (uint32_t)(sSpare / CHUNK_VERTS << 16) | (uint32_t)part);
+                glDrawArrays(GL_TRIANGLES, sSpare, part);
+                sSpare += part;
+                fe_stat_draws++;
+                fe_stat_vertices_out += part;
+            }
+        }
+        if (t0) fe_time_first_draw_us = (unsigned)(plat_time_us() - t0);
         fe_stat_triangles_out += n / 3;
     }
 }
 
-static int batch_vertices(const Batch *b) { return b->chunks ? (b->chunks - 1) * CHUNK_VERTS + b->last : 0; }
-static inline OutVtx *batch_vertex(const Batch *b, int i) { return &sPool[b->chunk[i / CHUNK_VERTS] * CHUNK_VERTS + i % CHUNK_VERTS]; }
-static void batch_resize(Batch *b, int vertices) {
-    b->chunks = (uint8_t)((vertices + CHUNK_VERTS - 1) / CHUNK_VERTS);
-    b->last = vertices ? vertices - (b->chunks - 1) * CHUNK_VERTS : CHUNK_VERTS;
+static int batch_triangles(const Batch *b) {
+    int n = 0;
+    for (int k = 0; k < b->chunks; k++) n += sChunkIndices[b->chunk[k]] / 3;
+    return n;
 }
 /* How much of a fogged triangle is seen: its area in pixels times how far it shows through
  * the fog (its colours already carry that), as a level on a scale of eight steps per doubling
  * (1 to 65,000 square pixels fully clear). */
 #define LEVELS 128
-static inline unsigned showing(const OutVtx *v) {
-    float ia = 1.f / v[0].w, ib = 1.f / v[1].w, ic = 1.f / v[2].w;
-    float ax = v[0].x * ia, ay = v[0].y * ia;
-    float area2 = ((v[1].x * ib - ax) * (v[2].y * ic - ay) - (v[2].x * ic - ax) * (v[1].y * ib - ay)) * sHalfW * sHalfH;
-    unsigned a = v[0].color >> 24, b = v[1].color >> 24, c = v[2].color >> 24;
+static inline unsigned showing(const OutVtx *p, const OutVtx *q, const OutVtx *r) {
+    float ia = 1.f / p->w, ib = 1.f / q->w, ic = 1.f / r->w;
+    float ax = p->x * ia, ay = p->y * ia;
+    float area2 = ((q->x * ib - ax) * (r->y * ic - ay) - (r->x * ic - ax) * (q->y * ib - ay)) * sHalfW * sHalfH;
+    unsigned a = p->color >> 24, b = q->color >> 24, c = r->color >> 24;
     union { float f; uint32_t u; } score;
     score.f = (area2 < 0.f ? -area2 : area2) * (float)(a + b + c + 3u);
     uint32_t level = (score.u >> 20) & 0x7ffu;          /* exponent and three bits: 8 per doubling */
@@ -726,15 +833,16 @@ static inline unsigned showing(const OutVtx *v) {
 /* Keep the frame within the budget. The fogged scenery gives way first, and of it the
  * triangles that show least: small and far into the fog. If that is not enough (it never
  * has been: the unfogged scenery and everything else come to a few hundred) the unfogged
- * scenery is cut short. */
+ * scenery is cut short. Only corners are taken out of the lists; a vertex no triangle uses
+ * any more stays in its chunk. */
 static void trim(void) {
     int total = 0;
     fe_stat_trimmed = fe_stat_cut = 0;
-    for (int i = 0; i < sBatchCount; i++) total += batch_vertices(&sBatches[i]) / 3;
+    for (int i = 0; i < sBatchCount; i++) total += batch_triangles(&sBatches[i]);
     int excess = total - fe_option_budget;
     if (excess <= 0) return;
     static uint16_t count[LEVELS];
-    static uint8_t level[CHUNKS * CHUNK_VERTS / 3];
+    static uint8_t level[CHUNKS * CHUNK_INDICES / 3];
     for (int i = 0; i < LEVELS; i++) count[i] = 0;
     int t = 0;
     for (int i = 0; i < sBatchCount; i++) {
@@ -743,9 +851,12 @@ static void trim(void) {
         /* the scenery has a light map; what has none is the monkeys and the water, which stay
          * unless the scenery alone cannot make the room */
         const unsigned keep = b->tex1 ? 0u : LEVELS / 2u;
-        for (int j = 0, n = batch_vertices(b); j < n; j += 3) {
-            unsigned l = showing(batch_vertex(b, j)) / 2u + keep;
-            count[level[t++] = (uint8_t)l]++;
+        for (int k = 0; k < b->chunks; k++) {
+            const uint16_t *index = sIndex[b->chunk[k]];
+            for (int j = 0, n = sChunkIndices[b->chunk[k]]; j < n; j += 3) {
+                unsigned l = showing(&sPool[index[j]], &sPool[index[j + 1]], &sPool[index[j + 2]]) / 2u + keep;
+                count[level[t++] = (uint8_t)l]++;
+            }
         }
     }
     int cut = 0, going = 0;
@@ -756,22 +867,27 @@ static void trim(void) {
     for (int i = 0; i < sBatchCount; i++) {
         Batch *b = &sBatches[i];
         if (b->kind != FOGGED) continue;
-        int kept = 0;
-        for (int j = 0, n = batch_vertices(b); j < n; j += 3) {
-            int l = level[t++];
-            if (l < cut || (l == cut && partial > 0 && partial--)) { fe_stat_trimmed++; continue; }
-            if (kept != j) { const OutVtx *v = batch_vertex(b, j); OutVtx *o = batch_vertex(b, kept); o[0] = v[0]; o[1] = v[1]; o[2] = v[2]; }
-            kept += 3;
+        for (int k = 0; k < b->chunks; k++) {
+            uint16_t *index = sIndex[b->chunk[k]];
+            int kept = 0;
+            for (int j = 0, n = sChunkIndices[b->chunk[k]]; j < n; j += 3) {
+                int l = level[t++];
+                if (l < cut || (l == cut && partial > 0 && partial--)) { fe_stat_trimmed++; continue; }
+                if (kept != j) { index[kept] = index[j]; index[kept + 1] = index[j + 1]; index[kept + 2] = index[j + 2]; }
+                kept += 3;
+            }
+            sChunkIndices[b->chunk[k]] = (uint16_t)kept;
         }
-        batch_resize(b, kept);
     }
     excess -= fe_stat_trimmed;
     for (int i = sBatchCount - 1; i >= 0 && excess > 0; i--) {
         Batch *b = &sBatches[i];
         if (b->kind != OPAQUE) continue;
-        int n = batch_vertices(b) / 3, drop = n < excess ? n : excess;
-        batch_resize(b, (n - drop) * 3);
-        excess -= drop; fe_stat_trimmed += drop;
+        for (int k = b->chunks - 1; k >= 0 && excess > 0; k--) {
+            int n = sChunkIndices[b->chunk[k]] / 3, drop = n < excess ? n : excess;
+            sChunkIndices[b->chunk[k]] = (uint16_t)((n - drop) * 3);
+            excess -= drop; fe_stat_trimmed += drop;
+        }
     }
 }
 
@@ -784,34 +900,27 @@ void fe_frame_end(void) {
 static void submit(void) {
     if (!sChunksUsed) return;
     trim();
+    sSpare = sChunksUsed * CHUNK_VERTS;
+    fe_stat_vertices_out = 0;
 #ifndef AB_NANO
     if (getenv("TR_DUMP_BATCHES"))
         for (int i = 0; i < sBatchCount; i++) {
             const Batch *bt = &sBatches[i];
-            fprintf(stderr, "batch %d kind %d tex %u/%u blend %d depth %d mask %d:", i, bt->kind, bt->tex0, bt->tex1, bt->blend, bt->depth_test, bt->depth_mask);
-            int total = 0;
-            for (int k = 0; k < bt->chunks; k++) total += k + 1 == bt->chunks ? bt->last : CHUNK_VERTS;
-            fprintf(stderr, " %d vertices\n", total);
-            if (bt->kind == ORDERED && !bt->depth_test)
-                for (int j = 0; j < bt->last && bt->chunks == 1; j += 3) {
-                    const OutVtx *v = &sPool[bt->chunk[0] * CHUNK_VERTS + j];
-                    fprintf(stderr, "   (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) z %.3f w %.2f uv (%.3f,%.3f) colour %08x\n", (v[0].x + 1) * sHalfW, (1 - v[0].y) * sHalfH,
-                            (v[1].x + 1) * sHalfW, (1 - v[1].y) * sHalfH, (v[2].x + 1) * sHalfW, (1 - v[2].y) * sHalfH, v[0].z, v[0].w, v[0].u0, v[0].v0, v[0].color);
-                }
+            int vertices = 0;
+            for (int k = 0; k < bt->chunks; k++) vertices += sChunkVerts[bt->chunk[k]];
+            fprintf(stderr, "batch %d kind %d tex %u/%u blend %d depth %d mask %d: %d triangles, %d vertices in %d chunks\n", i, bt->kind, bt->tex0, bt->tex1,
+                    bt->blend, bt->depth_test, bt->depth_mask, batch_triangles(bt), vertices, bt->chunks);
         }
-#endif
-#ifndef AB_NANO
     for (int i = 0; i < sBatchCount; i++) {             /* host check: nothing given to GL may touch a clip boundary */
         const Batch *bt = &sBatches[i];
         for (int k = 0; k < bt->chunks; k++) {
-            int n = k + 1 == bt->chunks ? bt->last : CHUNK_VERTS;
-            for (int j = 0; j < n; j++) {
-                const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
+            int c = bt->chunk[k];
+            const uint16_t *index = sIndex[c];
+            for (int j = 0, n = sChunkIndices[c]; j < n; j++) {
+                if (index[j] < c * CHUNK_VERTS || index[j] >= c * CHUNK_VERTS + sChunkVerts[c]) { fe_stat_outside++; continue; }   /* a corner outside its chunk */
+                const OutVtx *v = &sPool[index[j]];
                 if (!(v->w > 0.f && v->x > -v->w && v->x < v->w && v->y > -v->w && v->y < v->w && v->z > -v->w && v->z < v->w))
                     fe_stat_outside++;
-            }
-            for (int j = 0; j < n; j++) {
-                const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
                 float d = v->z / v->w, au = v->u0 < 0 ? -v->u0 : v->u0, av = v->v0 < 0 ? -v->v0 : v->v0;
                 if (v->w < fe_ext_min_w) fe_ext_min_w = v->w;
                 if (v->w > fe_ext_max_w) fe_ext_max_w = v->w;
@@ -820,14 +929,14 @@ static void submit(void) {
                 if (au > fe_ext_max_uv) fe_ext_max_uv = au;
                 if (av > fe_ext_max_uv) fe_ext_max_uv = av;
             }
-            for (int j = 0; j + 2 < n; j += 3) {        /* and none may be a sliver */
-                const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
+            for (int j = 0, n = sChunkIndices[c]; j + 2 < n; j += 3) {      /* and none may be a sliver */
                 float x[3], y[3];
-                for (int c = 0; c < 3; c++) { x[c] = v[c].x / v[c].w * sHalfW; y[c] = v[c].y / v[c].w * sHalfH; }
+                for (int e = 0; e < 3; e++) { const OutVtx *v = &sPool[index[j + e]]; x[e] = v->x / v->w * sHalfW; y[e] = v->y / v->w * sHalfH; }
                 float area2 = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
                 if (area2 < 0.f) area2 = -area2;
                 if (!drawable(x[0], y[0], x[1], y[1], x[2], y[2], area2 * 1.02f, 3.9f)) fe_stat_slivers++;
             }
+            fe_host_vertices += sChunkVerts[c];
         }
     }
 #endif

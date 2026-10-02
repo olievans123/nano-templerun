@@ -122,6 +122,17 @@ pvr = pvrtc.encode_pvr(sheet, mipmaps=False)
 decoded = Image.frombytes('RGBA', (SHEET, SHEET), texture2ddecoder.decode_pvrtc(pvr[52:], SHEET, SHEET, 0), 'raw', 'BGRA')
 (host / 'uiSheet.rgba').write_bytes(struct.pack('<II', SHEET, SHEET) + decoded.tobytes())
 
+# The loading screen is the phone's launch picture (Default.png), cut to the panel's shape
+# and squeezed into a square texture; like the scenery it has its smaller levels.
+launch = read_png(APP / 'Default@2x.png').convert('RGB')
+lw, lh = launch.size
+cw = lh * 240 // 432
+launch = launch.crop(((lw - cw) // 2, 0, (lw - cw) // 2 + cw, lh)).resize((512, 512), Image.LANCZOS)
+pvr = pvrtc.encode_pvr(launch, mipmaps=True)
+(nano / 'splash.pvr').write_bytes(pvr)
+decoded = Image.frombytes('RGBA', (512, 512), texture2ddecoder.decode_pvrtc(pvr[52:52 + 512 * 512 // 2], 512, 512, 0), 'raw', 'BGRA')
+(host / 'splash.rgba').write_bytes(struct.pack('<II', 512, 512) + decoded.tobytes())
+
 for stale in ('testMip256', 'testMip1024'):     # test textures of earlier builds
     for f in (nano / (stale + '.pvr'), host / (stale + '.rgba')):
         if f.exists():

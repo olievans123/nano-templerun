@@ -136,6 +136,7 @@ int main(int argc, char **argv) {
     glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, rb[1]);
     glViewport(0, 0, W, H);
     glEnable(GL_DEPTH_TEST);
+    for (int i = 0; i < 3; i++) { game_splash(W, H, i > 0); glFinish(); if (i == 2 && getenv("TR_SHOT_SPLASH")) screenshot(getenv("TR_SHOT_SPLASH")); }
     if (!game_init(W, H, getenv("TR_HEAP") ? (uint32_t)strtoul(getenv("TR_HEAP"), 0, 0) : 8u << 20, argc > 5 ? (uint32_t)atoi(argv[5]) : 1u)) return 1;
     fprintf(stderr, "loaded: guest heap %u bytes high water, %u in use; buffer objects %u bytes\n", (unsigned)rt_heap_peak(),
             (unsigned)rt_heap_used(), fe_buffer_bytes);
@@ -145,6 +146,7 @@ int main(int argc, char **argv) {
 
     uint64_t t0 = plat_time_us();
     if (getenv("TR_NOCULL")) fe_option_box_cull = 0;
+    if (getenv("TR_ARRAYS")) fe_option_indexed = 0;
     if (getenv("TR_CAP")) fe_option_budget = atoi(getenv("TR_CAP"));
     for (int f = 0; f < frames; f++) {
 
@@ -192,6 +194,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "per frame: %ld draw calls from the engine, %ld vertices and %ld triangles in; %ld calls gave nothing (%ld vertices, %ld of them in meshes off one side)\n",
             calls / frames, vin / frames, tin / frames, idle_calls / frames, idle_vertices / frames, idle_off / frames);
     fprintf(stderr, "left out by their box: %ld vertices a frame\n", boxed / frames);
+    { extern long fe_host_vertices; fprintf(stderr, "given to GL: %ld vertices a frame\n", fe_host_vertices / frames); }
     if (getenv("TR_HIST")) {
         fprintf(stderr, "budget %d: %ld triangles left out in %d frames; highest cut level %d of 127; frames by cut (none, then 16 wide):", fe_option_budget, capped, capped_frames, cut_max);
         for (int i = 0; i < 9; i++) fprintf(stderr, " %d", cut_hist[i]);
