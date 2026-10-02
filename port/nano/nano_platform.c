@@ -248,24 +248,46 @@ static uint32_t touch_presses;static int touch_report;
  * is only refreshed when the UI task gets round to its touch events, and this game's long
  * frames leave it little time; the list itself is filled by the touch driver. */
 #define OS_TOUCH_HEAD ((volatile uint32_t *)0x089a5298u)
-static uint32_t touch_from_list,touch_from_mailbox;
+static uint32_t touch_from_list,touch_from_mailbox,touch_stale,touch_nodes_most,touch_lifts;
+/* 1 with the finger's place if the list holds a touch that is down, 2 if all it holds have
+ * lifted, 0 if it is empty or cannot be read. Every entry is looked at: a touch that has
+ * lifted can still be at the front when the next one is already down. */
 static int list_touch(int16_t *x,int16_t *y) {
     volatile uint32_t *head=OS_TOUCH_HEAD;
     if(head[5]==0)return 0;
-    uint32_t end=head[4];
+    uint32_t end=head[4],nodes=0;int down=0;
     if(end<0x08000000u||end>=0x10000000u)return 0;
-    uint32_t first=*(volatile uint32_t *)end;
-    if(first==end||first<0x08000000u||first>=0x10000000u)return 0;
-    volatile int32_t *value=(volatile int32_t *)(first+8);
-    if(*((volatile uint8_t *)(first+8)+4)==1)return 0;          /* status 1: lifted */
-    *x=(int16_t)value[2];*y=(int16_t)value[3];
-    return 1;
+    for(uint32_t node=*(volatile uint32_t *)end;node!=end && nodes<8;node=*(volatile uint32_t *)node,nodes++) {
+        if(node<0x08000000u||node>=0x10000000u)return 0;
+        volatile int32_t *value=(volatile int32_t *)(node+8);
+        if(*((volatile uint8_t *)(node+8)+4)==1)continue;      /* status 1: lifted */
+        *x=(int16_t)value[2];*y=(int16_t)value[3];down=1;
+    }
+    if(nodes>touch_nodes_most)touch_nodes_most=nodes;
+    return down?1:nodes?2:0;
 }
+/* The finger now. The OS list is what the touch driver keeps and is right at once; the
+ * resident's mailbox follows only when the UI task has handled its events, which during a
+ * 40 ms frame can be a good while later. Going by the mailbox whenever it said "down" held a
+ * finger down after it had lifted, and the engine takes one swipe per touch: the next swipe
+ * was then not a new touch and did nothing. So when the list shows the touch lifted, the
+ * mailbox's "down" is not believed until it has caught up: until it has shown the finger up,
+ * or down where the list last had it. */
 void plat_poll(void) {
+    static int distrust;static int16_t listed_x,listed_y;
     hb_spoint_t f;hb_surface_touch_read(&f);
-    int down=f.down!=0;
-    if(down)touch_from_mailbox++;
-    else if(list_touch(&f.x,&f.y)){down=1;touch_from_list++;}
+    int16_t lx=0,ly=0;
+    int listed=list_touch(&lx,&ly),down;
+    if(!f.down)distrust=0;
+    else if(distrust) {
+        int dx=f.x-listed_x,dy=f.y-listed_y;
+        if(dx>-12 && dx<12 && dy>-12 && dy<12 && listed==1)distrust=0;
+    }
+    if(listed==1){down=1;f.x=lx;f.y=ly;listed_x=lx;listed_y=ly;touch_from_list++;}
+    else if(listed==2){down=0;if(touch_last_down)touch_lifts++;if(f.down){distrust=1;touch_stale++;}}
+    else if(f.down && !distrust){down=1;touch_from_mailbox++;}
+    else {down=0;if(f.down)touch_stale++;}
+    if(!down){f.x=touch_last_x;f.y=touch_last_y;}       /* a touch ends where it was last seen */
     if(down==touch_last_down && (!down || (f.x==touch_last_x && f.y==touch_last_y)))return;
     if(down && !touch_last_down) {
         touch_presses++;
@@ -389,9 +411,9 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
                  (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),
                  (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),
                  (unsigned)(perf.first/perf.frames),perf.max_work,perf.max_period,perf.over40);
-        plat_log("  per frame %u vertices in (vertex part %u us; %u more left out by box), %u triangles out (most %u; %u left out in %u frames), %u draws; dropped %u; state %d, distance %d, best %d, presses %u (mailbox %u, list %u); heap free %u, engine heap %u",
+        plat_log("  per frame %u vertices in (vertex part %u us; %u more left out by box), %u triangles out (most %u; %u left out in %u frames), %u draws; dropped %u; state %d, distance %d, best %d, presses %u (mailbox %u, list %u, mailbox stale %u, lifts by list %u, most entries %u); heap free %u, engine heap %u",
                  perf.vertices/perf.frames,(unsigned)(vertex_us/perf.frames),(unsigned)(boxed/perf.frames),perf.triangles/perf.frames,(unsigned)most_triangles,(unsigned)trimmed,(unsigned)trimmed_frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),game_best(),
-                 (unsigned)touch_presses,(unsigned)touch_from_mailbox,(unsigned)touch_from_list,hb_os_heap_free(),(unsigned)rt_heap_peak());
+                 (unsigned)touch_presses,(unsigned)touch_from_mailbox,(unsigned)touch_from_list,(unsigned)touch_stale,(unsigned)touch_lifts,(unsigned)touch_nodes_most,hb_os_heap_free(),(unsigned)rt_heap_peak());
         flush_log();
         memset(&perf,0,sizeof perf);most_triangles=trimmed=trimmed_frames=0;vertex_us=boxed=0;
         last=0;
