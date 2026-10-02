@@ -136,6 +136,7 @@ static inline uint32_t rt_fbits(float f) { union { float f; uint32_t u; } x; x.f
 static inline float rt_float(uint32_t u) { union { float f; uint32_t u; } x; x.u = u; return x.f; }
 extern double rt_clock;                 /* what the engine reads as the time, in seconds */
 extern int rt_tutorial_enabled;
+extern float rt_display_scale;          /* the panel's width over 320: see DISPLAY_OFFSETS in tools/recomp.py */
 
 /* Hooks the platform layer supplies. */
 unsigned rt_host_load_texture(const char *name, const char *file, int repeat);

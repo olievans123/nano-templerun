@@ -111,6 +111,12 @@ class Image:
 
 # Engine functions that tell the port they are starting (the function itself still runs).
 NOTIFY = {'__ZN7cMesh3D25createVertexBufferObjectsEv': 'rt_note_mesh'}
+# Two distances the engine gives in points of the phone's 320-wide screen without applying
+# its own display scale (cGameController::handleBatching places the "250m" text 6 left of and
+# 55 below the board it hangs on). After the instruction at each address the register is
+# multiplied by rt_display_scale: 1 on the phone and in the tests, so the translation is still
+# checked exactly as the original; the port sets it to its panel's scale.
+DISPLAY_OFFSETS = {0x1dcac: 'd3', 0x1dcd4: 'd1'}
 CALLEE_SAVED = {'r4', 'r5', 'r6', 'r7', 'r8', 'r10', 'r11', 'lr'}
 LITERALS_BASE = 0xf4000
 LITERALS = {}           # original address -> (new address, bytes)
@@ -833,6 +839,8 @@ class Function:
                 raise Unsupported('%s at %x: %s %s: %s' % (self.name, pc, ins.mnemonic, ins.op_str, e)) from None
             except (IndexError, KeyError, AttributeError, TypeError) as e:
                 raise Unsupported('%s at %x: %s %s: internal %r' % (self.name, pc, ins.mnemonic, ins.op_str, e)) from None
+            if pc in DISPLAY_OFFSETS:
+                stmts = list(stmts) + ['%s.f[0] *= rt_display_scale;' % DISPLAY_OFFSETS[pc]]
             text = ' '.join(stmts)
             if ins.cc not in (ARM_CC_AL, ARM_CC_INVALID) and pc not in self.never:
                 text = 'if (%s) { %s }' % (CC[ins.cc], text)

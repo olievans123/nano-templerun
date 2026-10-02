@@ -92,6 +92,7 @@ int game_init(int panel_w, int panel_h, uint32_t heap_bytes, uint32_t seed) {
     sGame = rt_alloc(596);
     rt_invoke(rt_lookup("__ZN15cGameControllerC1Efffb"), 5, sGame, rt_fbits((float)panel_w), rt_fbits((float)panel_h), rt_fbits(1.0f), 0u);
     MF(sGame + DISPLAY_SCALE_OFFSET) = (float)panel_w / 320.0f;
+    rt_display_scale = (float)panel_w / 320.0f;
     sScratch = rt_alloc(32);
     CRUMB("engine");
     rt_invoke(rt_lookup("__ZN15cGameController9initalizeEv"), 1, sGame);

@@ -15,6 +15,7 @@ uint8_t *g_mem;
 uint32_t R0, R1, R2, R3, SP;
 double rt_clock = 1000.0;
 int rt_tutorial_enabled;
+float rt_display_scale = 1.0f;
 
 static uint8_t *sArena;
 static uint32_t sHeapEnd, sBrk, sHeapUsed, sHeapPeak, sStackLow = RT_STACK_TOP;

@@ -816,9 +816,9 @@ static int batch_triangles(const Batch *b) {
     for (int k = 0; k < b->chunks; k++) n += sChunkIndices[b->chunk[k]] / 3;
     return n;
 }
-/* How much of a fogged triangle is seen: its area in pixels times how far it shows through
- * the fog (its colours already carry that), as a level on a scale of eight steps per doubling
- * (1 to 65,000 square pixels fully clear). */
+/* How much of a triangle is seen: its area in pixels times how far it shows through the fog
+ * (its colours already carry that), as a level on a scale of four steps per doubling, which
+ * reaches from a triangle of a pixel barely showing to one many times the size of the panel. */
 #define LEVELS 128
 static inline unsigned showing(const OutVtx *p, const OutVtx *q, const OutVtx *r) {
     float ia = 1.f / p->w, ib = 1.f / q->w, ic = 1.f / r->w;
@@ -827,46 +827,47 @@ static inline unsigned showing(const OutVtx *p, const OutVtx *q, const OutVtx *r
     unsigned a = p->color >> 24, b = q->color >> 24, c = r->color >> 24;
     union { float f; uint32_t u; } score;
     score.f = (area2 < 0.f ? -area2 : area2) * (float)(a + b + c + 3u);
-    uint32_t level = (score.u >> 20) & 0x7ffu;          /* exponent and three bits: 8 per doubling */
-    return level <= 1016u ? 0u : level >= 1016u + LEVELS ? LEVELS - 1u : level - 1016u;
+    uint32_t level = (score.u >> 21) & 0x3ffu;          /* exponent and two bits: 4 per doubling */
+    return level <= 508u ? 0u : level >= 508u + LEVELS ? LEVELS - 1u : level - 508u;
 }
-/* Keep the frame within the budget. The fogged scenery gives way first, and of it the
- * triangles that show least: small and far into the fog. If that is not enough (it never
- * has been: the unfogged scenery and everything else come to a few hundred) the unfogged
- * scenery is cut short. Only corners are taken out of the lists; a vertex no triangle uses
- * any more stays in its chunk. */
+/* Keep the frame within the budget: the scenery's triangles that show least give way, the
+ * small and those far into the fog (an unfogged one counts by its area alone). As the run
+ * begins the camera swings round the temple with nearly everything close and clear; taking
+ * only fogged triangles there left the rest to be cut off the end of the unfogged batches,
+ * and that was whole stretches of floor. Only corners are taken out of the lists; a vertex
+ * no triangle uses any more stays in its chunk. */
 static void trim(void) {
     int total = 0;
     fe_stat_trimmed = fe_stat_cut = 0;
     for (int i = 0; i < sBatchCount; i++) total += batch_triangles(&sBatches[i]);
     int excess = total - fe_option_budget;
     if (excess <= 0) return;
-    static uint16_t count[LEVELS];
+    static uint16_t count[2 * LEVELS];
     static uint8_t level[CHUNKS * CHUNK_INDICES / 3];
-    for (int i = 0; i < LEVELS; i++) count[i] = 0;
+    for (int i = 0; i < 2 * LEVELS; i++) count[i] = 0;
     int t = 0;
     for (int i = 0; i < sBatchCount; i++) {
         const Batch *b = &sBatches[i];
-        if (b->kind != FOGGED) continue;
+        if (b->kind == ORDERED) continue;
         /* the scenery has a light map; what has none is the monkeys and the water, which stay
          * unless the scenery alone cannot make the room */
-        const unsigned keep = b->tex1 ? 0u : LEVELS / 2u;
+        const unsigned keep = b->tex1 ? 0u : LEVELS;
         for (int k = 0; k < b->chunks; k++) {
             const uint16_t *index = sIndex[b->chunk[k]];
             for (int j = 0, n = sChunkIndices[b->chunk[k]]; j < n; j += 3) {
-                unsigned l = showing(&sPool[index[j]], &sPool[index[j + 1]], &sPool[index[j + 2]]) / 2u + keep;
+                unsigned l = showing(&sPool[index[j]], &sPool[index[j + 1]], &sPool[index[j + 2]]) + keep;
                 count[level[t++] = (uint8_t)l]++;
             }
         }
     }
     int cut = 0, going = 0;
-    while (cut < LEVELS - 1 && going + count[cut] < excess) going += count[cut++];
+    while (cut < 2 * LEVELS - 1 && going + count[cut] < excess) going += count[cut++];
     int partial = excess - going;                       /* this many of the last level go too */
     fe_stat_cut = cut;
     t = 0;
     for (int i = 0; i < sBatchCount; i++) {
         Batch *b = &sBatches[i];
-        if (b->kind != FOGGED) continue;
+        if (b->kind == ORDERED) continue;
         for (int k = 0; k < b->chunks; k++) {
             uint16_t *index = sIndex[b->chunk[k]];
             int kept = 0;

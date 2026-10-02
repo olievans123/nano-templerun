@@ -386,9 +386,8 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
 
     /* The first frames after the textures go up only clear the screen. */
     game_set_drawing(count>=4);
-    /* One frame in sixteen is given to GL the old way, each triangle with its own vertices,
-     * so the log can say what the indexed draws save on this driver. */
-    fe_option_indexed=(count&15u)!=15u;
+    /* (Measured on the iPod with one frame in sixteen drawn the old way, each triangle with
+     * its own vertices: 8.2-8.3 ms a frame indexed against 9.5-10.0 ms.) */
     port_crumb("heap",hb_os_heap_free(),hb_os_heap_largest());
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();

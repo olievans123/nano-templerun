@@ -165,7 +165,7 @@ int main(int argc, char **argv) {
             if (getenv("TR_RUNS")) fprintf(stderr, "run %d ended at frame %d: distance %d, score %d, coins %d\n", runs, f, game_distance(), game_score(), game_coins());
         }
         last_state = game_state();
-        capped += fe_stat_trimmed; if (fe_stat_trimmed) capped_frames++; if (fe_stat_cut > cut_max) cut_max = fe_stat_cut; cut_hist[fe_stat_trimmed ? 1 + fe_stat_cut / 16 : 0]++;
+        capped += fe_stat_trimmed; if (fe_stat_trimmed) capped_frames++; if (fe_stat_cut > cut_max) cut_max = fe_stat_cut; cut_hist[fe_stat_trimmed ? 1 + fe_stat_cut / 32 : 0]++;
         { int bin = fe_stat_triangles_out / 100; if (bin > 39) bin = 39; sHist[bin]++; if (fe_stat_triangles_out > sHistMax) { sHistMax = fe_stat_triangles_out; sHistMaxFrame = f; } }
         { extern int fe_stat_idle_calls, fe_stat_idle_vertices, fe_stat_idle_offscreen, fe_stat_calls, fe_stat_vertices_in, fe_stat_triangles_in;
           calls += fe_stat_calls; idle_calls += fe_stat_idle_calls; idle_vertices += fe_stat_idle_vertices; idle_off += fe_stat_idle_offscreen; boxed += fe_stat_box_culled; vin += fe_stat_vertices_in; tin += fe_stat_triangles_in; }
@@ -196,7 +196,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "left out by their box: %ld vertices a frame\n", boxed / frames);
     { extern long fe_host_vertices; fprintf(stderr, "given to GL: %ld vertices a frame\n", fe_host_vertices / frames); }
     if (getenv("TR_HIST")) {
-        fprintf(stderr, "budget %d: %ld triangles left out in %d frames; highest cut level %d of 127; frames by cut (none, then 16 wide):", fe_option_budget, capped, capped_frames, cut_max);
+        fprintf(stderr, "budget %d: %ld triangles left out in %d frames; highest cut level %d of 255; frames by cut (none, then 32 wide):", fe_option_budget, capped, capped_frames, cut_max);
         for (int i = 0; i < 9; i++) fprintf(stderr, " %d", cut_hist[i]);
         fprintf(stderr, "\ntriangles per frame: most %d (frame %d);", sHistMax, sHistMaxFrame);
         int over[5] = { 1200, 1300, 1400, 1500, 2000 };
