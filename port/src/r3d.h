@@ -20,4 +20,6 @@ void r3d_end(void);
 
 extern int r3d_stat_draws, r3d_stat_vertices_in, r3d_stat_triangles_in, r3d_stat_triangles_out,
            r3d_stat_tiny, r3d_stat_clipped;
+extern int r3d_stat_dropped;    /* triangles lost because the frame's vertex pool was full */
+extern int r3d_stat_outside;    /* host builds: vertices that reached GL on or outside a clip boundary (must stay 0) */
 #endif

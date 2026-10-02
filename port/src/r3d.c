@@ -1,4 +1,5 @@
 /* r3d.c — see r3d.h. */
+#include <stddef.h>
 #include <string.h>
 #include "gl.h"
 #include "platform.h"
@@ -11,17 +12,43 @@
 #define GL_TEXTURE1 0x84C1
 #endif
 
+#ifdef AB_NANO
+extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail that survives a reboot */
+#define CRUMB(tag, a) port_crumb(tag, (uint32_t)(a), 0)
+#else
+#define CRUMB(tag, a) ((void)0)
+#endif
+
 #define MAX_MESH_VERTS 2048
 #define BATCHES        6
-#define BATCH_VERTS    3072             /* a multiple of 3 */
-#define NEAR_W         1.0f             /* clip at the camera's near plane (w = near distance) */
+/* One pool of vertices per frame, handed out in chunks to the texture pairs; nothing in it
+ * is overwritten until the next frame, and it is uploaded to a buffer object before the
+ * draws (the pattern the Angry Birds and Mario Kart ports proved on the nano). */
+#define CHUNK_VERTS    1536             /* a multiple of 3 */
+#define CHUNKS         9
+#ifndef GL_ARRAY_BUFFER
+#define GL_ARRAY_BUFFER 0x8892
+#endif
+#ifndef GL_DYNAMIC_DRAW
+#define GL_DYNAMIC_DRAW 0x88E8
+#endif
+/* Everything is clipped here, a little inside the view volume GL would clip to, so the
+ * driver never clips (its own clipping of a corner that sits on a boundary can leave the
+ * zero-area sliver that reboots the iPod). The side planes are inset by 1/1024 of the
+ * half-screen (a ninth of a pixel on the nano's 240-pixel width). */
+#define INSET          0.9990234375f    /* 1 - 1/1024 */
+static float sNearW = 1.015625f, sFarW = 393.75f;       /* set from the projection in r3d_begin */
 
 typedef struct { float x, y, z, w, u0, v0, u1, v1; } Vtx;
-typedef struct { unsigned tex0, tex1; int count; Vtx v[BATCH_VERTS]; } Batch;
+typedef struct { unsigned tex0, tex1; int used, chunks, chunk[CHUNKS], last; } Batch;   /* last: vertices in the newest chunk */
 
 int r3d_stat_draws, r3d_stat_vertices_in, r3d_stat_triangles_in, r3d_stat_triangles_out, r3d_stat_tiny,
-    r3d_stat_clipped;
+    r3d_stat_clipped, r3d_stat_outside;
 static Batch sBatch[BATCHES];
+static Vtx sPool[CHUNKS * CHUNK_VERTS];
+static int sChunksUsed;
+static GLuint sVbo;
+int r3d_stat_dropped;
 static float sViewProj[16], sHalfW, sHalfH;
 static Vtx sClip[MAX_MESH_VERTS];
 static float sSX[MAX_MESH_VERTS], sSY[MAX_MESH_VERTS];
@@ -34,20 +61,26 @@ static void multiply(float out[16], const float a[16], const float b[16]) {     
 }
 
 void r3d_init(void) {
-    for (int i = 0; i < BATCHES; i++) sBatch[i].count = 0;
+    for (int i = 0; i < BATCHES; i++) sBatch[i].used = 0;
+    sChunksUsed = 0;
+    sVbo = 0;                           /* a new GL view has none of our objects */
 }
 
 void r3d_begin(int panel_w, int panel_h, const float projection[16], const float view[16]) {
     multiply(sViewProj, projection, view);
+    /* a perspective matrix: z_clip = A*z_eye + B, w = -z_eye; near = B/(A-1), far = B/(A+1) */
+    float A = projection[10], B = projection[14];
+    sNearW = B / (A - 1.f) * 1.015625f;
+    sFarW = B / (A + 1.f) * 0.984375f;
     sHalfW = (float)panel_w * 0.5f;
     sHalfH = (float)panel_h * 0.5f;
     r3d_stat_draws = r3d_stat_vertices_in = r3d_stat_triangles_in = r3d_stat_triangles_out = 0;
-    r3d_stat_tiny = r3d_stat_clipped = 0;
-    for (int i = 0; i < BATCHES; i++) sBatch[i].count = 0;
+    r3d_stat_tiny = r3d_stat_clipped = r3d_stat_dropped = 0;
+    for (int i = 0; i < BATCHES; i++) sBatch[i].used = 0;
+    sChunksUsed = 0;
 }
 
-static void flush(Batch *b) {
-    if (!b->count) return;
+static void draw_batch(const Batch *b) {
     glActiveTexture(GL_TEXTURE1);
     glClientActiveTexture(GL_TEXTURE1);
     if (b->tex1) {
@@ -55,61 +88,106 @@ static void flush(Batch *b) {
         glBindTexture(GL_TEXTURE_2D, b->tex1);
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
         glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-        glTexCoordPointer(2, GL_FLOAT, sizeof(Vtx), &b->v[0].u1);
     } else {
         glDisable(GL_TEXTURE_2D);
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     }
     glActiveTexture(GL_TEXTURE0);
     glClientActiveTexture(GL_TEXTURE0);
-    glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, b->tex0);
-    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glTexCoordPointer(2, GL_FLOAT, sizeof(Vtx), &b->v[0].u0);
-    glVertexPointer(4, GL_FLOAT, sizeof(Vtx), &b->v[0].x);
-    glDrawArrays(GL_TRIANGLES, 0, b->count);
-    r3d_stat_draws++;
-    r3d_stat_triangles_out += b->count / 3;
-    b->count = 0;
+    for (int k = 0; k < b->chunks; k++) {
+        int n = k + 1 == b->chunks ? b->last : CHUNK_VERTS;
+        if (!n) continue;
+        CRUMB("arrays", (uint32_t)(b->chunk[k] << 16) | (uint32_t)n);
+        glDrawArrays(GL_TRIANGLES, b->chunk[k] * CHUNK_VERTS, n);
+        r3d_stat_draws++;
+        r3d_stat_triangles_out += n / 3;
+    }
 }
 
 static Batch *batch_for(unsigned tex0, unsigned tex1) {
     Batch *free_one = NULL;
     for (int i = 0; i < BATCHES; i++) {
         Batch *b = &sBatch[i];
-        if (b->count && b->tex0 == tex0 && b->tex1 == tex1) return b;
-        if (!b->count && !free_one) free_one = b;
+        if (b->used && b->tex0 == tex0 && b->tex1 == tex1) return b;
+        if (!b->used && !free_one) free_one = b;
     }
-    if (!free_one) {                    /* all in use by other textures: send the fullest */
-        free_one = &sBatch[0];
-        for (int i = 1; i < BATCHES; i++) if (sBatch[i].count > free_one->count) free_one = &sBatch[i];
-        flush(free_one);
-    }
+    if (!free_one) return NULL;         /* more texture pairs in a frame than BATCHES */
+    free_one->used = 1;
     free_one->tex0 = tex0;
     free_one->tex1 = tex1;
+    free_one->chunks = 0;
+    free_one->last = CHUNK_VERTS;       /* forces a first chunk */
     return free_one;
 }
 
-/* One triangle wholly in front of the near plane: cull, guard, emit. */
-static void emit(Batch **pb, unsigned tex0, unsigned tex1, const Vtx *a, const Vtx *b, const Vtx *c,
+/* Room for one more triangle in the batch, or NULL when the frame's pool is full. */
+static Vtx *reserve(Batch *b) {
+    if (b->last + 3 > CHUNK_VERTS) {
+        if (sChunksUsed == CHUNKS) { r3d_stat_dropped++; return NULL; }
+        b->chunk[b->chunks++] = sChunksUsed++;
+        b->last = 0;
+    }
+    Vtx *v = &sPool[b->chunk[b->chunks - 1] * CHUNK_VERTS + b->last];
+    b->last += 3;
+    return v;
+}
+
+/* One triangle wholly inside the view volume: cull, guard, emit. */
+static void emit(Batch *bt, const Vtx *a, const Vtx *b, const Vtx *c,
                  float ax, float ay, float bx, float by, float cx, float cy, int cull) {
     float area2 = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);       /* pixels, y up */
     if (cull && area2 >= 0.f) return;                                   /* front faces are clockwise */
     if (area2 < 0.f) area2 = -area2;
     if (!(area2 >= 0.25f)) { r3d_stat_tiny++; return; }                 /* also rejects NaN */
-    Batch *bt = *pb;
-    if (bt->count + 3 > BATCH_VERTS) { flush(bt); bt = *pb = batch_for(tex0, tex1); }
-    bt->v[bt->count++] = *a;
-    bt->v[bt->count++] = *b;
-    bt->v[bt->count++] = *c;
+    Vtx *v = reserve(bt);
+    if (!v) return;
+    v[0] = *a;
+    v[1] = *b;
+    v[2] = *c;
 }
 
-static void lerp(Vtx *o, const Vtx *a, const Vtx *b) {                  /* where the edge meets w = NEAR_W */
-    float t = (NEAR_W - a->w) / (b->w - a->w);
-    o->x = a->x + (b->x - a->x) * t;  o->y = a->y + (b->y - a->y) * t;
-    o->z = a->z + (b->z - a->z) * t;  o->w = NEAR_W;
-    o->u0 = a->u0 + (b->u0 - a->u0) * t;  o->v0 = a->v0 + (b->v0 - a->v0) * t;
-    o->u1 = a->u1 + (b->u1 - a->u1) * t;  o->v1 = a->v1 + (b->v1 - a->v1) * t;
+/* Signed distance to clip plane `bit` (>= 0 is inside). */
+static float plane(const Vtx *v, int bit) {
+    switch (bit) {
+    case 0: return v->x + v->w * INSET;
+    case 1: return v->w * INSET - v->x;
+    case 2: return v->y + v->w * INSET;
+    case 3: return v->w * INSET - v->y;
+    case 4: return v->w - sNearW;
+    default: return sFarW - v->w;
+    }
+}
+
+static unsigned char outcode(const Vtx *v) {
+    float e = v->w * INSET;
+    unsigned char code = 0;
+    if (v->x < -e) code |= 1;
+    if (v->x > e) code |= 2;
+    if (v->y < -e) code |= 4;
+    if (v->y > e) code |= 8;
+    if (v->w < sNearW) code |= 16;
+    if (v->w > sFarW) code |= 32;
+    return code;
+}
+
+/* Sutherland-Hodgman against one plane; returns the new vertex count. */
+static int clip_plane(const Vtx *in, int n, Vtx *out, int bit) {
+    int count = 0;
+    for (int k = 0; k < n; k++) {
+        const Vtx *p = &in[k], *q = &in[(k + 1) % n];
+        float dp = plane(p, bit), dq = plane(q, bit);
+        if (dp >= 0.f) out[count++] = *p;
+        if ((dp >= 0.f) != (dq >= 0.f)) {
+            float t = dp / (dp - dq);
+            Vtx *o = &out[count++];
+            o->x = p->x + (q->x - p->x) * t;  o->y = p->y + (q->y - p->y) * t;
+            o->z = p->z + (q->z - p->z) * t;  o->w = p->w + (q->w - p->w) * t;
+            o->u0 = p->u0 + (q->u0 - p->u0) * t;  o->v0 = p->v0 + (q->v0 - p->v0) * t;
+            o->u1 = p->u1 + (q->u1 - p->u1) * t;  o->v1 = p->v1 + (q->v1 - p->v1) * t;
+        }
+    }
+    return count;
 }
 
 void r3d_mesh(const TRMesh *m, int frame, const float model[16], unsigned tex0, unsigned tex1, int cull) {
@@ -138,16 +216,10 @@ void r3d_mesh(const TRMesh *m, int frame, const float model[16], unsigned tex0, 
         } else {
             o->u1 = o->v1 = 0.f;
         }
-        unsigned char code = 0;
-        if (o->w < NEAR_W) code |= 16;
-        if (o->x < -o->w) code |= 1;
-        if (o->x > o->w) code |= 2;
-        if (o->y < -o->w) code |= 4;
-        if (o->y > o->w) code |= 8;
-        if (o->z > o->w) code |= 32;
+        unsigned char code = outcode(o);
         sCode[i] = code;
         all &= code;
-        if (!(code & 16)) {
+        if (!code) {
             float inv = 1.f / o->w;
             sSX[i] = o->x * inv * sHalfW;
             sSY[i] = o->y * inv * sHalfH;
@@ -157,41 +229,42 @@ void r3d_mesh(const TRMesh *m, int frame, const float model[16], unsigned tex0, 
     r3d_stat_triangles_in += f->index_count / 3;
     if (all) return;                                    /* the whole mesh is off one side */
     Batch *b = batch_for(tex0, tex1);
+    if (!b) return;
     const uint16_t *idx = m->indices + f->index_start;
     for (int i = 0; i + 2 < f->index_count; i += 3) {
         unsigned ia = idx[i], ib = idx[i + 1], ic = idx[i + 2];
         if (ia >= (unsigned)n || ib >= (unsigned)n || ic >= (unsigned)n) continue;
         unsigned char ca = sCode[ia], cb = sCode[ib], cc = sCode[ic];
-        if (ca & cb & cc) continue;                     /* off one side of the view (or behind) */
-        if (!((ca | cb | cc) & 16)) {
-            emit(&b, tex0, tex1, &sClip[ia], &sClip[ib], &sClip[ic], sSX[ia], sSY[ia], sSX[ib], sSY[ib], sSX[ic], sSY[ic], cull);
+        if (ca & cb & cc) continue;                     /* off one side of the view */
+        unsigned char any = ca | cb | cc;
+        if (!any) {
+            emit(b, &sClip[ia], &sClip[ib], &sClip[ic], sSX[ia], sSY[ia], sSX[ib], sSY[ib], sSX[ic], sSY[ic], cull);
             continue;
         }
-        /* crosses the near plane: clip to it (a triangle gives a triangle or a quad) */
-        const Vtx *in[3] = { &sClip[ia], &sClip[ib], &sClip[ic] };
-        Vtx poly[4];
-        int count = 0;
-        for (int k = 0; k < 3; k++) {
-            const Vtx *p = in[k], *q = in[(k + 1) % 3];
-            int pin = p->w >= NEAR_W, qin = q->w >= NEAR_W;
-            if (pin) poly[count++] = *p;
-            if (pin != qin) lerp(&poly[count++], p, q);
+        /* crosses the edge of the view: clip to every plane it crosses */
+        Vtx bufa[10], bufb[10], *in = bufa, *out = bufb;
+        int count = 3;
+        in[0] = sClip[ia]; in[1] = sClip[ib]; in[2] = sClip[ic];
+        for (int bit = 0; bit < 6 && count >= 3; bit++) {
+            if (!(any & (1 << bit))) continue;
+            count = clip_plane(in, count, out, bit);
+            Vtx *t = in; in = out; out = t;
         }
         r3d_stat_clipped++;
         if (count < 3) continue;
-        float sx[4], sy[4];
+        float sx[10], sy[10];
         for (int k = 0; k < count; k++) {
-            float inv = 1.f / poly[k].w;
-            sx[k] = poly[k].x * inv * sHalfW;
-            sy[k] = poly[k].y * inv * sHalfH;
+            float inv = 1.f / in[k].w;
+            sx[k] = in[k].x * inv * sHalfW;
+            sy[k] = in[k].y * inv * sHalfH;
         }
-        emit(&b, tex0, tex1, &poly[0], &poly[1], &poly[2], sx[0], sy[0], sx[1], sy[1], sx[2], sy[2], cull);
-        if (count == 4)
-            emit(&b, tex0, tex1, &poly[0], &poly[2], &poly[3], sx[0], sy[0], sx[2], sy[2], sx[3], sy[3], cull);
+        for (int k = 1; k + 1 < count; k++)
+            emit(b, &in[0], &in[k], &in[k + 1], sx[0], sy[0], sx[k], sy[k], sx[k + 1], sy[k + 1], cull);
     }
 }
 
 void r3d_end(void) {
+    if (!sChunksUsed) return;
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glMatrixMode(GL_MODELVIEW);
@@ -201,11 +274,42 @@ void r3d_end(void) {
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_NORMAL_ARRAY);
     glColor4f(1.f, 1.f, 1.f, 1.f);
-    for (int i = 0; i < BATCHES; i++) flush(&sBatch[i]);
+#ifndef AB_NANO
+    /* host check: nothing handed to GL may touch a clip boundary */
+    for (int i = 0; i < BATCHES; i++) {
+        const Batch *bt = &sBatch[i];
+        for (int k = 0; bt->used && k < bt->chunks; k++) {
+            int n = k + 1 == bt->chunks ? bt->last : CHUNK_VERTS;
+            for (int j = 0; j < n; j++) {
+                const Vtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
+                if (!(v->w > 0.f && v->x > -v->w && v->x < v->w && v->y > -v->w && v->y < v->w && v->z > -v->w && v->z < v->w))
+                    r3d_stat_outside++;
+            }
+        }
+    }
+#endif
+    if (!sVbo) glGenBuffers(1, &sVbo);
+    if (!sVbo) { plat_log("r3d: no vertex buffer"); return; }
+    CRUMB("buffer", sChunksUsed);
+    glBindBuffer(GL_ARRAY_BUFFER, sVbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)sChunksUsed * CHUNK_VERTS * sizeof(Vtx)), sPool, GL_DYNAMIC_DRAW);
+    glVertexPointer(4, GL_FLOAT, sizeof(Vtx), (const void *)offsetof(Vtx, x));
+    glActiveTexture(GL_TEXTURE1);
+    glClientActiveTexture(GL_TEXTURE1);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(Vtx), (const void *)offsetof(Vtx, u1));
+    glActiveTexture(GL_TEXTURE0);
+    glClientActiveTexture(GL_TEXTURE0);
+    glEnable(GL_TEXTURE_2D);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(Vtx), (const void *)offsetof(Vtx, u0));
+    for (int i = 0; i < BATCHES; i++)
+        if (sBatch[i].used) draw_batch(&sBatch[i]);
     glActiveTexture(GL_TEXTURE1);
     glClientActiveTexture(GL_TEXTURE1);
     glDisable(GL_TEXTURE_2D);
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     glActiveTexture(GL_TEXTURE0);
     glClientActiveTexture(GL_TEXTURE0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    CRUMB("ended", r3d_stat_triangles_out);
 }
