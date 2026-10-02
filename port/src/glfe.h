@@ -45,6 +45,9 @@ void fe_note_mesh(uint32_t mesh);
 void fe_reset(void);                                /* once, before the engine starts */
 void fe_frame_begin(int panel_w, int panel_h);      /* clears; the engine's draw() goes between these */
 void fe_frame_end(void);                            /* hands the frame's triangles to OpenGL */
+/* A picture over the scene (the port's own screens): panel pixels from the top left, texture
+ * coordinates 0..1, a premultiplied colour as bytes r, g, b, a in memory order. */
+void fe_overlay(unsigned texture, float x, float y, float w, float h, float u0, float v0, float u1, float v1, uint32_t rgba);
 extern int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_triangles_out, fe_stat_tiny,
            fe_stat_clipped, fe_stat_dropped, fe_stat_calls, fe_stat_fogged;
 extern int fe_option_fog_blend;

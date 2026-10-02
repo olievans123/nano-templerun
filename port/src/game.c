@@ -10,6 +10,12 @@
 #include "platform.h"
 #include "rt.h"
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+unsigned rt_host_load_texture(const char *name, const char *file, int repeat);
+static void load_screens(void);
 
 #ifdef AB_NANO
 extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail that survives a reboot */
@@ -22,7 +28,8 @@ unsigned fe_time_draw_us;       /* the last frame's time in the engine's draw(),
 static uint32_t sGame, sScratch;
 static uint32_t fSimulate, fDraw, fStart, fRestart, fTouchBegan, fTouchMoved, fTouchEnded, fTilt, fIsGameOver,
                 fIsGameOverFinished, fGetScore, fGetCoins, fGetDistance, fIsPaused, fUnpause;
-static int sW, sH, sState, sTouching;
+static int sW, sH, sState, sTouching, sRuns;
+static uint32_t fGetDeathType;
 static float sTilt;
 /* The engine sizes its on-screen display for a screen 320 points wide; it has one scale for
  * that display (1 on the phone, 2 on the iPad), which the shell sets for the panel's width. */
@@ -49,6 +56,7 @@ int game_init(int panel_w, int panel_h, uint32_t heap_bytes, uint32_t seed) {
     fGetDistance = rt_lookup("__ZNK15cGameController14getDistanceRunEv");
     fIsPaused = rt_lookup("__ZNK15cGameController8isPausedEv");
     fUnpause = rt_lookup("__ZN15cGameController7unpauseEv");
+    fGetDeathType = rt_lookup("__ZNK15cGameController12getDeathTypeEv");
     CRUMB("ctor");
     sGame = rt_alloc(596);
     rt_invoke(rt_lookup("__ZN15cGameControllerC1Efffb"), 5, sGame, rt_fbits((float)panel_w), rt_fbits((float)panel_h), rt_fbits(1.0f), 0u);
@@ -59,6 +67,7 @@ int game_init(int panel_w, int panel_h, uint32_t heap_bytes, uint32_t seed) {
     CRUMB("level");
     rt_invoke(rt_lookup("__ZN15cGameController20loadLevelInformationEv"), 1, sGame);
     rt_invoke(fSimulate, 2, sGame, rt_fbits(0.01f));
+    load_screens();
     CRUMB("ready");
     sState = GAME_TITLE;
     return 1;
@@ -160,6 +169,108 @@ static void autopilot(void) {
     }
 }
 
+/* ---- the port's own screens ---------------------------------------------------------------------
+ * On the phone the title, pause and game-over screens were UIKit views over the game view.
+ * These are drawn from the same pictures (packed by tools/convert_assets.py into uiSheet,
+ * with ui.txt saying where each one is), sized for a panel 240 wide as the phone's were for 320. */
+typedef struct { char name[16]; float x, y, w, h; } Sprite;
+static Sprite sSprites[40];
+static int sSpriteCount;
+static unsigned sUiTexture;
+#define SHEET 1024.0f
+#define WHITE 0xffffffffu
+
+static void load_screens(void) {
+    uint32_t size = 0;
+    char *text = plat_read_file("ui.txt", &size, 0);
+    if (!text) return;
+    for (uint32_t i = 0; i < size && sSpriteCount < 40;) {
+        Sprite *sp = &sSprites[sSpriteCount];
+        uint32_t n = 0;
+        while (i < size && text[i] != ' ' && text[i] != '\n' && n < 15) sp->name[n++] = text[i++];
+        sp->name[n] = 0;
+        float value[4] = { 0, 0, 0, 0 };
+        for (int k = 0; k < 4; k++) {
+            while (i < size && text[i] == ' ') i++;
+            while (i < size && text[i] >= '0' && text[i] <= '9') value[k] = value[k] * 10.0f + (float)(text[i++] - '0');
+        }
+        while (i < size && text[i] != '\n') i++;
+        i++;
+        if (n && value[2] > 0.0f) { sp->x = value[0]; sp->y = value[1]; sp->w = value[2]; sp->h = value[3]; sSpriteCount++; }
+    }
+    free(text);
+    sUiTexture = rt_host_load_texture("uiSheet", "uiSheet.png", 0);
+}
+
+static const Sprite *sprite(const char *name) {
+    for (int i = 0; i < sSpriteCount; i++) if (!strcmp(sSprites[i].name, name)) return &sSprites[i];
+    return NULL;
+}
+
+/* Draw a sprite `width` panel pixels wide with its top left at (x, y); returns its height. */
+static float picture(const char *name, float x, float y, float width, uint32_t colour) {
+    const Sprite *sp = sprite(name);
+    if (!sp || !sUiTexture) return 0.0f;
+    float height = width * sp->h / sp->w;
+    fe_overlay(sUiTexture, x, y, width, height, sp->x / SHEET, sp->y / SHEET, (sp->x + sp->w) / SHEET, (sp->y + sp->h) / SHEET, colour);
+    return height;
+}
+
+/* A number with thousands separators, centred on cx; `scale` is panel pixels per sheet pixel. */
+static void number(int value, const char *suffix, float cx, float y, float scale, uint32_t colour) {
+    char digits[16], text[24];
+    int n = 0, len = 0;
+    if (value < 0) value = 0;
+    do { digits[n++] = (char)('0' + value % 10); value /= 10; } while (value && n < 12);
+    for (int i = n - 1; i >= 0; i--) { text[len++] = digits[i]; if (i && i % 3 == 0) text[len++] = ','; }
+    for (; suffix && *suffix && len < 22; suffix++) text[len++] = *suffix;
+    float width = 0.0f;
+    char name[12];
+    for (int i = 0; i < len; i++) {
+        snprintf(name, sizeof name, text[i] == ',' ? "glyphComma" : "glyph%c", text[i]);
+        const Sprite *sp = sprite(name);
+        if (sp) width += sp->w * scale;
+    }
+    float x = cx - width * 0.5f;
+    for (int i = 0; i < len; i++) {
+        snprintf(name, sizeof name, text[i] == ',' ? "glyphComma" : "glyph%c", text[i]);
+        const Sprite *sp = sprite(name);
+        if (!sp) continue;
+        picture(name, x, y, sp->w * scale, colour);
+        x += sp->w * scale;
+    }
+}
+
+static void draw_screens(void) {
+    float w = (float)sW, h = (float)sH, k = w / 320.0f;        /* the phone's layouts were 320 wide */
+    static const char *const death[8] = { "deathTree", "deathFallA", "deathTree", "deathSlide", "deathLedge", "deathBurnt",
+                                          "deathEaten", "deathTangle" };
+    if (sState == GAME_TITLE) {
+        picture("logo", 0.0f, 12.0f * k, w, WHITE);
+        picture("idol", (w - 170.0f * k) * 0.5f, h - 190.0f * k, 170.0f * k, WHITE);
+    } else if (sState == GAME_OVER) {
+        float pw = 300.0f * k, px = (w - pw) * 0.5f, py = 30.0f * k, y;
+        uint32_t ink = 0xff0c2038u;                             /* dark brown: bytes r, g, b, a */
+        picture("panel", px, py, pw, WHITE);
+        uint32_t type = rt_invoke(fGetDeathType, 1, sGame);
+        const char *art = type == 1 && (sRuns & 1) ? "deathWater" : death[type < 8 ? type : 0];
+        y = py + 26.0f * k;
+        y += picture(art, (w - 228.0f * k) * 0.5f, y, 228.0f * k, WHITE) + 14.0f * k;
+        y += picture("score", (w - 200.0f * k) * 0.5f, y, 200.0f * k, WHITE) + 6.0f * k;
+        number(game_score(), NULL, w * 0.5f, y, 1.0f * k, ink);
+        y += 52.0f * k;
+        number(game_distance(), "m", w * 0.5f, y, 0.62f * k, ink);
+        y += 34.0f * k;
+        float cw = 22.0f * k;
+        picture("coin", w * 0.5f - 44.0f * k, y + 3.0f * k, cw, WHITE);
+        number(game_coins(), NULL, w * 0.5f + 14.0f * k, y, 0.62f * k, ink);
+        picture("runAgain", (w - 270.0f * k) * 0.5f, py + 494.0f * 300.0f / 320.0f * k - 92.0f * k, 270.0f * k, WHITE);
+    } else if (rt_invoke(fIsPaused, 1, sGame)) {
+        picture("paused", (w - 220.0f * k) * 0.5f, 120.0f * k, 220.0f * k, WHITE);
+        picture("resume", (w - 270.0f * k) * 0.5f, 220.0f * k, 270.0f * k, WHITE);
+    }
+}
+
 void game_frame(float dt) {
     if (dt > 0.25f) dt = 0.25f;                                     /* as -[EAGLView mainEventLoop] */
     if (dt <= 0.0f) dt = 0.001f;
@@ -170,7 +281,7 @@ void game_frame(float dt) {
     }
     uint64_t t0 = plat_time_us();
     rt_invoke(fSimulate, 2, sGame, rt_fbits(dt));
-    if (sState == GAME_RUNNING && rt_invoke(fIsGameOverFinished, 1, sGame)) sState = GAME_OVER;
+    if (sState == GAME_RUNNING && rt_invoke(fIsGameOverFinished, 1, sGame)) { sState = GAME_OVER; sRuns++; }
     fe_time_engine_us = (uint32_t)(plat_time_us() - t0);
     CRUMB("clear");
     fe_frame_begin(sW, sH);
@@ -179,6 +290,7 @@ void game_frame(float dt) {
     t0 = plat_time_us();
     rt_invoke(fDraw, 1, sGame);
     fe_time_draw_us = (uint32_t)(plat_time_us() - t0);
+    draw_screens();
     CRUMB("submit");
     fe_frame_end();
 }

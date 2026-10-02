@@ -62,6 +62,56 @@ for name, side in PNG.items():
     if stale.exists():
         stale.unlink()
 
+# The title, pause and game-over screens were iPhone (UIKit) views built from loose PNGs; the
+# port draws its own from the same pictures, packed here into one sheet with a list of where
+# each one is. The numbers are set in the app's own font.
+def build_ui_sheet():
+    from PIL import ImageDraw, ImageFont
+    sheet = Image.new('RGBA', (1024, 1024))
+    places = []
+
+    def put(name, image, x, y, size=None):
+        if size:
+            image = image.resize(size, Image.LANCZOS)
+        sheet.paste(image, (x, y))
+        places.append('%s %d %d %d %d' % (name, x, y, image.width, image.height))
+
+    def art(name):
+        big = APP / (name + '@2x.png')
+        return read_png(big if big.exists() else APP / (name + '.png'))
+
+    put('logo', art('mainMenuLogo'), 0, 0)
+    put('idol', art('mainMenuIdol'), 664, 0)
+    put('coin', art('coinLarge'), 672, 292)
+    put('runAgain', art('endGamePlayAgainButton'), 0, 372)
+    put('paused', art('pausedHeader'), 564, 372)
+    put('resume', art('pausedResumeButton'), 0, 508)
+    put('score', art('endGameScore'), 564, 500)
+    put('panel', read_png(APP / 'endGameBackground.png'), 0, 644, (246, 380))
+    deaths = ['FallA', 'Water', 'Tree', 'Slide', 'Ledge', 'Burnt', 'Eaten', 'Tangle', 'Fossil']
+    for i, name in enumerate(deaths):
+        put('death' + name, read_png(APP / ('deathIllustration%s.png' % name)), 262 + 252 * (i % 3), 644 + 128 * (i // 3))
+    font = ImageFont.truetype(str(APP / 'Cheboyga.ttf'), 40)
+    x = 564
+    for ch in '0123456789,m':
+        box = font.getbbox(ch)
+        w = box[2] + 2
+        glyph = Image.new('RGBA', (w, 44))
+        ImageDraw.Draw(glyph).text((1, 0), ch, font=font, fill=(255, 255, 255, 255))
+        put('glyph' + ('Comma' if ch == ',' else ch), glyph, x, 592)
+        x += w + 6
+    if x > 1024:
+        raise ValueError('the digits do not fit the sheet')
+    return sheet, places
+
+
+sheet, places = build_ui_sheet()
+pvr = pvrtc.encode_pvr(sheet, mipmaps=False)
+(nano / 'uiSheet.pvr').write_bytes(pvr)
+(nano / 'ui.txt').write_text('\n'.join(places) + '\n')
+decoded = Image.frombytes('RGBA', (1024, 1024), texture2ddecoder.decode_pvrtc(pvr[52:], 1024, 1024, 0), 'raw', 'BGRA')
+(host / 'uiSheet.rgba').write_bytes(struct.pack('<II', 1024, 1024) + decoded.tobytes())
+
 for pattern in ('*.bksb', '*.atlas', '*.fnt', 'modelRegistry.lvl'):
     for f in sorted(APP.glob(pattern)):
         shutil.copyfile(f, nano / f.name)

@@ -126,7 +126,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "loaded: guest heap %u bytes high water, %u in use; buffer objects %u bytes\n", (unsigned)rt_heap_peak(),
             (unsigned)rt_heap_used(), fe_buffer_bytes);
     long tris = 0, tiny = 0, clipped = 0, dropped = 0, fogged = 0, draws = 0;
-    int runs = 0, last_state = GAME_TITLE, best = 0;
+    int runs = 0, last_state = GAME_TITLE, best = 0, last_over = 0;
     game_autopilot(getenv("TR_NOAUTO") ? 0 : 1);
 
     uint64_t t0 = plat_time_us();
@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
         last_state = game_state();
         tris += fe_stat_triangles_out; tiny += fe_stat_tiny; clipped += fe_stat_clipped; dropped += fe_stat_dropped;
         fogged += fe_stat_fogged; draws += fe_stat_draws;
-        if (every && f % every == every - 1) {
+        if ((every && f % every == every - 1) || (getenv("TR_SHOT_STATES") && (f == 30 || (game_state() == GAME_OVER && last_over != runs && (last_over = runs))))) {
             char path[1024];
             snprintf(path, sizeof path, "%s/game%04d.png", argv[3], f + 1);
             screenshot(path);

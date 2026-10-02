@@ -539,6 +539,34 @@ void fe_draw_elements(uint32_t mode, int count, uint32_t type, uint32_t indices)
 }
 void fe_draw_arrays(uint32_t mode, int first, int count) { if (mode == 4) draw(count, NULL, first); }
 
+/* A flat picture over the finished scene, for the port's own screens: a rectangle in panel
+ * pixels (y down from the top), a rectangle of the texture in texels over its size, and a
+ * premultiplied colour. Drawn in call order after everything the engine drew. */
+void fe_overlay(unsigned texture, float x, float y, float w, float h, float u0, float v0, float u1, float v1, uint32_t rgba) {
+    Batch *b = batch_for(ORDERED, texture, 0, 1, 0, 0);
+    if (!b) return;
+    float l = x / sHalfW - 1.f, r = (x + w) / sHalfW - 1.f, t = 1.f - y / sHalfH, bt = 1.f - (y + h) / sHalfH;
+    /* nothing given to GL may reach the edge of the view: trim the rectangle to just inside it */
+    if (!(r > l) || !(t > bt)) return;
+    float du = (u1 - u0) / (r - l), dv = (v1 - v0) / (bt - t);
+    if (l < -INSET) { u0 += (-INSET - l) * du; l = -INSET; }
+    if (r > INSET) { u1 -= (r - INSET) * du; r = INSET; }
+    if (t > INSET) { v0 += (INSET - t) * dv; t = INSET; }
+    if (bt < -INSET) { v1 -= (-INSET - bt) * dv; bt = -INSET; }
+    if (!(r > l) || !(t > bt)) return;
+    const float corner[6][4] = { { l, t, u0, v0 }, { r, t, u1, v0 }, { r, bt, u1, v1 }, { l, t, u0, v0 }, { r, bt, u1, v1 }, { l, bt, u0, v1 } };
+    for (int half = 0; half < 2; half++) {
+        OutVtx *v = reserve(b);
+        if (!v) return;
+        for (int k = 0; k < 3; k++) {
+            const float *c = corner[half * 3 + k];
+            v[k].x = c[0]; v[k].y = c[1]; v[k].z = 0.f; v[k].w = 1.f;
+            v[k].u0 = c[2]; v[k].v0 = c[3]; v[k].u1 = v[k].v1 = 0.f;
+            v[k].color = rgba;
+        }
+    }
+}
+
 /* ---- frame ------------------------------------------------------------------------------- */
 void fe_frame_begin(int panel_w, int panel_h) {
     sHalfW = (float)panel_w * 0.5f;
