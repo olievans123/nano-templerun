@@ -91,6 +91,8 @@ uint32_t rt_lookup(const char *name);
 uint32_t rt_invoke(uint32_t addr, int argc, ...);
 uint32_t rt_alloc(uint32_t size);
 void rt_free(uint32_t addr);
+int rt_pin(uint32_t addr, uint32_t size);
+void rt_unpin(uint32_t addr);
 uint32_t rt_heap_used(void);
 uint32_t rt_heap_peak(void);
 uint32_t rt_stack_low(void);

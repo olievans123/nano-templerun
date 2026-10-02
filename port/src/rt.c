@@ -77,8 +77,27 @@ uint32_t rt_alloc(uint32_t size) {
     return addr;
 }
 
+/* A block the port wants to go on using after the engine frees it (vertex data handed to
+ * OpenGL): the free is remembered and takes effect when the block is unpinned. */
+#define PINNED 0x214e4950u
+#define PINNED_FREED 0x464e4950u
+int rt_pin(uint32_t addr, uint32_t size) {
+    if (addr < RT_HEAP + 16 || addr >= sBrk || (addr & 15)) return 0;
+    uint32_t n = M32(addr - 16);
+    if ((n & 15) || n < size || n > size + 32 || M32(addr - 8)) return 0;
+    M32(addr - 8) = PINNED;
+    return 1;
+}
+void rt_unpin(uint32_t addr) {
+    uint32_t state = M32(addr - 8);
+    M32(addr - 8) = 0;
+    if (state == PINNED_FREED) rt_free(addr);
+}
+
 void rt_free(uint32_t addr) {
     if (addr < RT_HEAP + 16 || addr >= sBrk) return;
+    if (M32(addr - 8) == PINNED) { M32(addr - 8) = PINNED_FREED; return; }
+    if (M32(addr - 8) == PINNED_FREED) return;
     uint32_t n = M32(addr - 16);
 #ifdef RT_TRACE
     { uint32_t r0 = R0, r1 = R1; R0 = n; R1 = addr; rt_trace(0xf4ee); R0 = r0; R1 = r1; }
