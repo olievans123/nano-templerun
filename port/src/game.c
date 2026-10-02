@@ -18,6 +18,7 @@ extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail 
 #define CRUMB(tag) ((void)0)
 #endif
 
+unsigned fe_time_draw_us;       /* the last frame's time in the engine's draw(), including the port's transform */
 static uint32_t sGame, sScratch;
 static uint32_t fSimulate, fDraw, fStart, fRestart, fTouchBegan, fTouchMoved, fTouchEnded, fTilt, fIsGameOver,
                 fIsGameOverFinished, fGetScore, fGetCoins, fGetDistance, fIsPaused, fUnpause;
@@ -172,7 +173,9 @@ void game_frame(float dt) {
     CRUMB("clear");
     fe_frame_begin(sW, sH);
     CRUMB("draw");
+    t0 = plat_time_us();
     rt_invoke(fDraw, 1, sGame);
+    fe_time_draw_us = (uint32_t)(plat_time_us() - t0);
     CRUMB("submit");
     fe_frame_end();
 }

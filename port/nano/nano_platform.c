@@ -142,6 +142,14 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
     if(manager)((event_fn)(0x084069d8u|1u))(manager,4);
 }
 
+/* The newest file written is lost if the iPod reboots soon after (the log came back empty
+ * three times), so the log is followed by a second small file. */
+static void flush_log(void) {
+    port_log_flush(DATA_DIR "/log.txt");
+    char *mark=memalign(64,4096);
+    if(mark){memset(mark,0,4096);memcpy(mark,"log written\n",12);hb_fs_write(DATA_DIR "/sync.txt",mark,12);free(mark);}
+}
+
 /* Fatal errors unwind to the frame driver, which stops the game; spinning would freeze the
  * iPod's UI task. */
 static jmp_buf fatal_jump;
@@ -153,7 +161,7 @@ void port_fatal(int code) {
     for(;;){}
 }
 void plat_fatal(const char *message) {
-    plat_log("fatal: %s",message);port_crumb("fatal",0,0);port_log_flush(DATA_DIR "/log.txt");port_fatal(1);
+    plat_log("fatal: %s",message);port_crumb("fatal",0,0);flush_log();port_fatal(1);
 }
 
 /* ---- textures: the original PVRTC files as they are; the PNG sheets as RGBA4444 ---- */
@@ -228,7 +236,8 @@ void rt_host_sound(const char *name,int loop,float pitch,int stop){(void)name;(v
 #define BEAT_US 33333u
 #define ENGINE_HEAP 0x110000u
 static uint32_t gap_short=5200,gap_long=8600,gap_estimate=6500;
-static struct { uint32_t frames,max_period,max_work,over40,triangles,draws,dropped;uint64_t period,work,engine; } perf;
+static struct { uint32_t frames,max_period,max_work,over40,triangles,draws,dropped,vertices;uint64_t period,work,engine,draw,transform,submit; } perf;
+extern unsigned fe_time_draw_us;
 
 void tr_nano_frame(int w,int h,uint32_t frame) {
     static uint64_t last,previous_end,started;static uint32_t previous_frame,count;static int reports,touching;
@@ -236,7 +245,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     fatal_armed=1;
     if(setjmp(fatal_jump)){fatal_armed=0;return;}
     if(initialized && frame<previous_frame) {           /* a new GL view: our textures are gone */
-        plat_log("the GL view was recreated; stopping");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;
+        plat_log("the GL view was recreated; stopping");flush_log();failed=1;fatal_armed=0;return;
     }
     previous_frame=frame;
     if(!initialized) {
@@ -251,19 +260,19 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         }
         port_crumb("init",0,0);
         uint32_t marker=0;void *flag=NULL;
-        if(manifest()){plat_log("files.lst is missing");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;}
+        if(manifest()){plat_log("files.lst is missing");flush_log();failed=1;fatal_armed=0;return;}
         flag=plat_read_file("autopilot.txt",&marker,1);
         if(flag){free(flag);game_autopilot(1);plat_log("autopilot on");}
         port_crumb("heap0",hb_os_heap_free(),0);
         if(!game_init(w,h,ENGINE_HEAP,hb_time_uptime_us()|1u)) {
-            plat_log("initialization failed");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;
+            plat_log("initialization failed");flush_log();failed=1;fatal_armed=0;return;
         }
         initialized=1;
         port_crumb("heap1",hb_os_heap_free(),0);
         plat_log("loaded in %u ms: heap free %u, largest %u; engine heap %u of %u; models %u; textures %u",
                  (unsigned)((plat_time_us()-t0)/1000u),hb_os_heap_free(),hb_os_heap_largest(),(unsigned)rt_heap_peak(),ENGINE_HEAP,
                  fe_buffer_bytes,(unsigned)texture_bytes);
-        port_log_flush(DATA_DIR "/log.txt");
+        flush_log();
         last=0;previous_end=0;started=plat_time_us();
     }
     keep_awake();
@@ -285,18 +294,6 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     float tilt=(float)-g[0]*0.001f;                     /* the phone reports gravity; the nano the opposite */
     game_tilt(tilt>1.f?1.f:tilt<-1.f?-1.f:tilt);
 
-    /* First runs on hardware: bring the drawing features in one at a time, so that a reboot's
-     * trail says which one the driver objected to. */
-    {
-        static int stage=-1;
-        int now_stage=count<90?0:count<180?1:2;
-        if(now_stage!=stage) {
-            stage=now_stage;
-            fe_option_fog_blend=stage>=1;
-            fe_option_min_area2=stage>=2?0.25f:4.0f;
-            port_crumb("stage",(uint32_t)stage,0);
-        }
-    }
     port_crumb("heap",hb_os_heap_free(),0);
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();
@@ -305,6 +302,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     port_crumb("drawn",count++,0);
     if(last!=now)period=0;
     perf.frames++;perf.period+=period;perf.work+=work;perf.engine+=(uint32_t)(fe_time_engine_us);
+    perf.draw+=fe_time_draw_us;perf.transform+=fe_time_transform_us;perf.submit+=fe_time_submit_us;perf.vertices+=(uint32_t)fe_stat_vertices_in;
     perf.triangles+=(uint32_t)fe_stat_triangles_out;perf.draws+=(uint32_t)fe_stat_draws;perf.dropped+=(uint32_t)fe_stat_dropped;
     if(period>perf.max_period)perf.max_period=period;
     if(work>perf.max_work)perf.max_work=work;
@@ -319,16 +317,17 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         while(plat_time_us()<until){}
     }
     /* A line of timings at a few moments (never per frame: file writes stall the iPod). */
-    static const uint16_t marks[8]={10,30,60,120,300,600,1200,2400};
+    static const uint16_t marks[8]={5,15,30,60,120,300,600,1200};
     uint32_t seconds=(uint32_t)((plat_time_us()-started)/1000000u);
     if(reports<8 && seconds>=marks[reports] && perf.frames) {
         reports++;
         uint32_t fps10=perf.period?(uint32_t)((uint64_t)perf.frames*10000000u/perf.period):0;
-        plat_log("%u s: %u frames, %u.%u fps, work %u us (engine %u), max work %u, max period %u, over 40 ms %u; per frame %u triangles, %u draws; dropped %u; state %d, distance %d; heap free %u, engine heap %u",
-                 (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),perf.max_work,
-                 perf.max_period,perf.over40,perf.triangles/perf.frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
+        plat_log("%u s: %u frames, %u.%u fps, work %u us = simulate %u + draw %u (of which transform %u) + submit %u; max work %u, max period %u, over 40 ms %u; per frame %u vertices in, %u triangles out, %u draws; dropped %u; state %d, distance %d; heap free %u, engine heap %u",
+                 (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),
+                 (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),perf.max_work,
+                 perf.max_period,perf.over40,perf.vertices/perf.frames,perf.triangles/perf.frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
                  hb_os_heap_free(),(unsigned)rt_heap_peak());
-        port_log_flush(DATA_DIR "/log.txt");
+        flush_log();
         memset(&perf,0,sizeof perf);
         last=0;
     }

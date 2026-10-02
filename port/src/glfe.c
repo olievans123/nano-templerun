@@ -241,7 +241,8 @@ unsigned fe_time_engine_us;
 /* Switches for finding what the nano's driver accepts: draw fogged triangles blended (1) or
  * plain (0); the smallest single-texture triangle kept, as twice its area in pixels. */
 int fe_option_fog_blend = 1;
-float fe_option_min_area2 = 0.25f;
+float fe_option_min_area2 = 4.0f;
+unsigned fe_time_transform_us, fe_time_submit_us;      /* this frame: in draw calls here; handing the frame to GL */
 int fe_peak_vertices, fe_peak_chunks, fe_peak_batches;   /* the most one draw call, one frame have needed */
 static Batch *batch_for(int kind, unsigned tex0, unsigned tex1, int blend, int depth_test, int depth_mask) {
     if (kind == ORDERED) {
@@ -378,7 +379,13 @@ static Buffer *packed_buffer(const Array *a) {
     return b && b->data && b->packed ? b : NULL;
 }
 
+static void draw_triangles(int count, const uint16_t *idx, int first);
 static void draw(int count, const uint16_t *idx, int first) {
+    uint64_t t0 = plat_time_us();
+    draw_triangles(count, idx, first);
+    fe_time_transform_us += (unsigned)(plat_time_us() - t0);
+}
+static void draw_triangles(int count, const uint16_t *idx, int first) {
     fe_stat_calls++;
     Buffer *packed = sVertexArray.enabled ? packed_buffer(&sVertexArray) : NULL;
     const uint8_t *pos = sVertexArray.enabled && !packed ? array_base(&sVertexArray) : NULL;
@@ -416,8 +423,9 @@ static void draw(int count, const uint16_t *idx, int first) {
     s.fogged_scene = sFog && !sBlend && sDepthTest && sDepthMask;
     s.fog_blend = fe_option_fog_blend;
     s.cull = sCull;
-    /* With two texture units the driver reboots on small triangles; 2 square pixels is safe.
-     * (Twice the area is compared.) Zero-area triangles are never safe. */
+    /* The driver reboots on small triangles: with two texture units (found with the test
+     * scene) and also with one (the first frame drawn with a 1/8-pixel guard rebooted the iPod,
+     * after 180 frames at 2 square pixels). Twice the area is compared. */
     s.min_area2 = s.tex1 ? 4.0f : fe_option_min_area2;
 
     float mvp[16];
@@ -518,6 +526,7 @@ void fe_frame_begin(int panel_w, int panel_h) {
     sOrderedOpen = -1;
     fe_stat_draws = fe_stat_vertices_in = fe_stat_triangles_in = fe_stat_triangles_out = fe_stat_tiny = 0;
     fe_stat_clipped = fe_stat_dropped = fe_stat_calls = fe_stat_fogged = 0;
+    fe_time_transform_us = fe_time_submit_us = 0;
     glViewport(0, 0, panel_w, panel_h);
     glClearColor(sClear[0], sClear[1], sClear[2], sClear[3]);
     glClearDepthf(1.f);
@@ -564,7 +573,13 @@ static void draw_batch(const Batch *b, int index) {
     }
 }
 
+static void submit(void);
 void fe_frame_end(void) {
+    uint64_t t0 = plat_time_us();
+    submit();
+    fe_time_submit_us = (unsigned)(plat_time_us() - t0);
+}
+static void submit(void) {
     if (!sChunksUsed) return;
 #ifndef AB_NANO
     for (int i = 0; i < sBatchCount; i++) {             /* host check: nothing given to GL may touch a clip boundary */
