@@ -242,6 +242,7 @@ unsigned fe_time_engine_us;
  * plain (0); the smallest single-texture triangle kept, as twice its area in pixels. */
 int fe_option_fog_blend = 1;
 float fe_option_min_area2 = 4.0f;
+unsigned fe_time_clear_us, fe_time_first_draw_us;       /* this frame: the clear; the first draw call given to GL */
 unsigned fe_time_transform_us, fe_time_submit_us;      /* this frame: in draw calls here; handing the frame to GL */
 int fe_peak_vertices, fe_peak_chunks, fe_peak_batches;   /* the most one draw call, one frame have needed */
 static Batch *batch_for(int kind, unsigned tex0, unsigned tex1, int blend, int depth_test, int depth_mask) {
@@ -282,11 +283,14 @@ static OutVtx *reserve(Batch *b) {
 }
 
 /* ---- transform, clip, cull ----------------------------------------------------------------- */
-typedef struct { float x, y, z, w, u0, v0, u1, v1, r, g, b, a, fog; } Vtx;
+/* Each vertex a draw call uses is transformed once into the form GL is given (OutVtx), with
+ * its fog factor already folded into the colour; triangles then copy three of them. Only a
+ * triangle that crosses the edge of the view is unpacked to floats (Vtx) for clipping. */
+typedef struct { float x, y, z, w, u0, v0, u1, v1, r, g, b, a; } Vtx;
 #define MAX_VERTS 2560
-static Vtx sVtx[MAX_VERTS];
+static OutVtx sOut[MAX_VERTS];
 static float sSX[MAX_VERTS], sSY[MAX_VERTS];
-static uint8_t sCode[MAX_VERTS];
+static uint8_t sCode[MAX_VERTS], sFogged[MAX_VERTS];
 /* Everything is clipped a little inside the view volume GL would clip to, so the driver
  * never clips: 1/1024 of the half-screen at the sides (a ninth of a pixel), and the same
  * fraction of the depth range. */
@@ -301,17 +305,6 @@ static float plane(const Vtx *v, int bit) {
     case 4: return v->z + v->w * INSET;
     default: return v->w * INSET - v->z;
     }
-}
-static uint8_t outcode(const Vtx *v) {
-    float e = v->w * INSET;
-    uint8_t code = 0;
-    if (v->x < -e) code |= 1;
-    if (v->x > e) code |= 2;
-    if (v->y < -e) code |= 4;
-    if (v->y > e) code |= 8;
-    if (v->z < -e) code |= 16;
-    if (v->z > e) code |= 32;
-    return code;
 }
 static int clip_plane(const Vtx *in, int n, Vtx *out, int bit) {
     int count = 0;
@@ -329,42 +322,23 @@ static int clip_plane(const Vtx *in, int n, Vtx *out, int bit) {
     return count;
 }
 
-static uint32_t pack_color(const Vtx *v, float scale) {
-    float r = v->r * scale, g = v->g * scale, b = v->b * scale, a = v->a * scale;
-    uint32_t R = r >= 1.f ? 255u : r <= 0.f ? 0u : (uint32_t)(r * 255.f + 0.5f);
-    uint32_t G = g >= 1.f ? 255u : g <= 0.f ? 0u : (uint32_t)(g * 255.f + 0.5f);
-    uint32_t B = b >= 1.f ? 255u : b <= 0.f ? 0u : (uint32_t)(b * 255.f + 0.5f);
-    uint32_t A = a >= 1.f ? 255u : a <= 0.f ? 0u : (uint32_t)(a * 255.f + 0.5f);
-    return R | G << 8 | B << 16 | A << 24;      /* bytes in memory: r, g, b, a */
+static inline uint32_t byte_of(float v) { return v >= 255.f ? 255u : v <= 0.f ? 0u : (uint32_t)(v + 0.5f); }
+static void unpack(Vtx *v, const OutVtx *o) {
+    v->x = o->x; v->y = o->y; v->z = o->z; v->w = o->w; v->u0 = o->u0; v->v0 = o->v0; v->u1 = o->u1; v->v1 = o->v1;
+    v->r = (float)(o->color & 255u); v->g = (float)((o->color >> 8) & 255u);
+    v->b = (float)((o->color >> 16) & 255u); v->a = (float)(o->color >> 24);
 }
 
-typedef struct { unsigned tex0, tex1; int fogged_scene, fog_blend, cull; float min_area2; } DrawState;
+typedef struct { unsigned tex0, tex1; int fogged_scene, cull; float min_area2; Batch *plain, *fogged; } DrawState;
 
-static void emit(const DrawState *s, const Vtx *a, const Vtx *b, const Vtx *c,
-                 float ax, float ay, float bx, float by, float cx, float cy) {
-    float area2 = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);       /* pixels, y up */
-    if (s->cull && area2 >= 0.f) return;                                /* front faces are clockwise */
-    if (area2 < 0.f) area2 = -area2;
-    if (!(area2 >= s->min_area2)) { fe_stat_tiny++; return; }           /* also rejects NaN */
-    Batch *bt;
-    int fogged = 0;
-    if (s->fogged_scene) {
-        fogged = s->fog_blend && (a->fog < 0.998f || b->fog < 0.998f || c->fog < 0.998f);
-        if (fogged && a->fog <= 0.002f && b->fog <= 0.002f && c->fog <= 0.002f) return;    /* lost in the fog */
-        bt = batch_for(fogged ? FOGGED : OPAQUE, s->tex0, s->tex1, fogged, 1, 1);
-        fe_stat_fogged += fogged;
-    } else {
-        bt = batch_for(ORDERED, s->tex0, s->tex1, sBlend, sDepthTest, sDepthMask);
+/* The batch a triangle of this draw call goes to; looked up once per call and kind. */
+static Batch *target(DrawState *s, int fogged) {
+    Batch **slot = fogged ? &s->fogged : &s->plain;
+    if (!*slot) {
+        if (s->fogged_scene) *slot = batch_for(fogged ? FOGGED : OPAQUE, s->tex0, s->tex1, fogged, 1, 1);
+        else *slot = batch_for(ORDERED, s->tex0, s->tex1, sBlend, sDepthTest, sDepthMask);
     }
-    OutVtx *v = bt ? reserve(bt) : NULL;
-    if (!v) return;
-    const Vtx *in[3] = { a, b, c };
-    for (int k = 0; k < 3; k++) {
-        const Vtx *p = in[k];
-        v[k].x = p->x; v[k].y = p->y; v[k].z = p->z; v[k].w = p->w;
-        v[k].u0 = p->u0; v[k].v0 = p->v0; v[k].u1 = p->u1; v[k].v1 = p->v1;
-        v[k].color = pack_color(p, fogged ? (p->fog < 0.f ? 0.f : p->fog > 1.f ? 1.f : p->fog) : 1.f);
-    }
+    return *slot;
 }
 
 static const uint8_t *array_base(const Array *a) {
@@ -379,12 +353,6 @@ static Buffer *packed_buffer(const Array *a) {
     return b && b->data && b->packed ? b : NULL;
 }
 
-static void draw_triangles(int count, const uint16_t *idx, int first);
-static void draw(int count, const uint16_t *idx, int first) {
-    uint64_t t0 = plat_time_us();
-    draw_triangles(count, idx, first);
-    fe_time_transform_us += (unsigned)(plat_time_us() - t0);
-}
 static void draw_triangles(int count, const uint16_t *idx, int first) {
     fe_stat_calls++;
     Buffer *packed = sVertexArray.enabled ? packed_buffer(&sVertexArray) : NULL;
@@ -398,6 +366,7 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
     if (packed && sVertexArray.pointer / packed->stride + (uint32_t)n > packed->size / packed->stride) return;
 
     DrawState s;
+    s.plain = s.fogged = NULL;
     s.tex0 = sTexEnabled[0] ? rt_texture_host(sTexBound[0]) : 0;
     const uint8_t *uv0 = s.tex0 && sTexCoordArray[0].enabled ? array_base(&sTexCoordArray[0]) : NULL;
     const uint8_t *uv1 = sTexEnabled[1] && sTexCoordArray[1].enabled ? array_base(&sTexCoordArray[1]) : NULL;
@@ -421,89 +390,141 @@ static void draw_triangles(int count, const uint16_t *idx, int first) {
     if (!s.tex1) { uv1 = NULL; pk1 = -1; }
     const uint8_t *col = sColorArray.enabled ? array_base(&sColorArray) : NULL;
     s.fogged_scene = sFog && !sBlend && sDepthTest && sDepthMask;
-    s.fog_blend = fe_option_fog_blend;
     s.cull = sCull;
     /* The driver reboots on small triangles: with two texture units (found with the test
      * scene) and also with one (the first frame drawn with a 1/8-pixel guard rebooted the iPod,
      * after 180 frames at 2 square pixels). Twice the area is compared. */
     s.min_area2 = s.tex1 ? 4.0f : fe_option_min_area2;
 
-    float mvp[16];
+    float m[16];
     const float *mv = sModelView[sModelViewTop];
-    multiply(mvp, sProjection[sProjectionTop], mv);
-    float tu0 = sTexture[0][sTextureTop[0]][12], tv0 = sTexture[0][sTextureTop[0]][13];
-    float tu1 = sTexture[1][sTextureTop[1]][12], tv1 = sTexture[1][sTextureTop[1]][13];
-    float fog_scale = sFog && sFogEnd > sFogStart ? 1.0f / (sFogEnd - sFogStart) : 0.0f;
-    int vs = sVertexArray.stride ? sVertexArray.stride : 12, cs = sColorArray.stride ? sColorArray.stride : 4;
-    int t0s = sTexCoordArray[0].stride ? sTexCoordArray[0].stride : 8, t1s = sTexCoordArray[1].stride ? sTexCoordArray[1].stride : 8;
+    multiply(m, sProjection[sProjectionTop], mv);
+    const float tu0 = sTexture[0][sTextureTop[0]][12], tv0 = sTexture[0][sTextureTop[0]][13];
+    const float tu1 = sTexture[1][sTextureTop[1]][12], tv1 = sTexture[1][sTextureTop[1]][13];
+    const int fog = sFog && sFogEnd > sFogStart, fog_blend = fog && s.fogged_scene && fe_option_fog_blend;
+    const float fog_scale = fog ? 1.0f / (sFogEnd - sFogStart) : 0.0f;
+    const float f2 = mv[2], f6 = mv[6], f10 = mv[10], f14 = mv[14], fog_end = sFogEnd;
+    const int vs = sVertexArray.stride ? sVertexArray.stride : 12, cs = sColorArray.stride ? sColorArray.stride : 4;
+    const int t0s = sTexCoordArray[0].stride ? sTexCoordArray[0].stride : 8, t1s = sTexCoordArray[1].stride ? sTexCoordArray[1].stride : 8;
+    const int pks = packed ? packed->packed_stride / 2 : 0;
+    const float ps = packed ? packed->pos_scale : 0.f;
+    const float us0 = packed && pk0 >= 0 ? packed->uv_scale[pk0] : 0.f, us1 = packed && pk1 >= 0 ? packed->uv_scale[pk1] : 0.f;
+    const uint32_t flat = byte_of(sColor[0] * 255.f) | byte_of(sColor[1] * 255.f) << 8 | byte_of(sColor[2] * 255.f) << 16
+                          | byte_of(sColor[3] * 255.f) << 24;
+    const float hw = sHalfW, hh = sHalfH;
     uint8_t all = 0xff;
-    int pks = packed ? packed->packed_stride / 2 : 0;
     for (int i = idx ? 0 : first; i < n; i++) {
-        float p[3];
-        Vtx *o = &sVtx[i];
+        float x, y, z;
+        OutVtx *o = &sOut[i];
         if (packed) {
             const int16_t *q = pk + (size_t)i * (size_t)pks;
-            p[0] = q[0] * packed->pos_scale; p[1] = q[1] * packed->pos_scale; p[2] = q[2] * packed->pos_scale;
-            if (pk0 >= 0) { o->u0 = q[3 + 2 * pk0] * packed->uv_scale[pk0] + tu0; o->v0 = q[4 + 2 * pk0] * packed->uv_scale[pk0] + tv0; }
-            if (pk1 >= 0) { o->u1 = q[3 + 2 * pk1] * packed->uv_scale[pk1] + tu1; o->v1 = q[4 + 2 * pk1] * packed->uv_scale[pk1] + tv1; }
-        } else memcpy(p, pos + (size_t)i * (size_t)vs, 12);
-        o->x = mvp[0] * p[0] + mvp[4] * p[1] + mvp[8] * p[2] + mvp[12];
-        o->y = mvp[1] * p[0] + mvp[5] * p[1] + mvp[9] * p[2] + mvp[13];
-        o->z = mvp[2] * p[0] + mvp[6] * p[1] + mvp[10] * p[2] + mvp[14];
-        o->w = mvp[3] * p[0] + mvp[7] * p[1] + mvp[11] * p[2] + mvp[15];
-        if (uv0) { float t[2]; memcpy(t, uv0 + (size_t)i * (size_t)t0s, 8); o->u0 = t[0] + tu0; o->v0 = t[1] + tv0; }
+            x = (float)q[0] * ps; y = (float)q[1] * ps; z = (float)q[2] * ps;
+            if (pk0 >= 0) { o->u0 = (float)q[3 + 2 * pk0] * us0 + tu0; o->v0 = (float)q[4 + 2 * pk0] * us0 + tv0; }
+            if (pk1 >= 0) { o->u1 = (float)q[3 + 2 * pk1] * us1 + tu1; o->v1 = (float)q[4 + 2 * pk1] * us1 + tv1; }
+        } else {
+            float p[3];
+            __builtin_memcpy(p, pos + (size_t)i * (size_t)vs, 12);
+            x = p[0]; y = p[1]; z = p[2];
+        }
+        float cx = m[0] * x + m[4] * y + m[8] * z + m[12], cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+        float cz = m[2] * x + m[6] * y + m[10] * z + m[14], cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+        o->x = cx; o->y = cy; o->z = cz; o->w = cw;
+        if (uv0) { float t[2]; __builtin_memcpy(t, uv0 + (size_t)i * (size_t)t0s, 8); o->u0 = t[0] + tu0; o->v0 = t[1] + tv0; }
         else if (pk0 < 0) o->u0 = o->v0 = 0.f;
-        if (uv1) { float t[2]; memcpy(t, uv1 + (size_t)i * (size_t)t1s, 8); o->u1 = t[0] + tu1; o->v1 = t[1] + tv1; }
+        if (uv1) { float t[2]; __builtin_memcpy(t, uv1 + (size_t)i * (size_t)t1s, 8); o->u1 = t[0] + tu1; o->v1 = t[1] + tv1; }
         else if (pk1 < 0) o->u1 = o->v1 = 0.f;
-        if (col) {
-            const uint8_t *c = col + (size_t)i * (size_t)cs;
-            o->r = c[0] * (1.f / 255.f); o->g = c[1] * (1.f / 255.f); o->b = c[2] * (1.f / 255.f); o->a = c[3] * (1.f / 255.f);
-        } else { o->r = sColor[0]; o->g = sColor[1]; o->b = sColor[2]; o->a = sColor[3]; }
-        if (sFog) {
-            float ez = mv[2] * p[0] + mv[6] * p[1] + mv[10] * p[2] + mv[14];
-            o->fog = (sFogEnd - (ez < 0.f ? -ez : ez)) * fog_scale;
-        } else o->fog = 1.f;
-        uint8_t code = outcode(o);
+        uint32_t c = flat;
+        if (col) __builtin_memcpy(&c, col + (size_t)i * (size_t)cs, 4);
+        uint8_t fogged = 0;
+        if (fog_blend) {
+            float ez = f2 * x + f6 * y + f10 * z + f14;
+            float f = (fog_end - (ez < 0.f ? -ez : ez)) * fog_scale;
+            if (f < 0.998f) {                           /* colour and alpha scaled by the fog factor */
+                uint32_t k = f <= 0.f ? 0u : (uint32_t)(f * 256.f);
+                c = ((c & 0x00ff00ffu) * k >> 8 & 0x00ff00ffu) | ((c >> 8 & 0x00ff00ffu) * k & 0xff00ff00u);
+                fogged = k < 2 ? 2 : 1;                 /* 2: lost in the fog */
+            }
+        }
+        o->color = c;
+        sFogged[i] = fogged;
+        float e = cw * INSET;
+        uint8_t code = (uint8_t)((cx < -e) | (cx > e) << 1 | (cy < -e) << 2 | (cy > e) << 3 | (cz < -e) << 4 | (cz > e) << 5);
         sCode[i] = code;
         all &= code;
         if (!code) {
-            float inv = 1.f / o->w;
-            sSX[i] = o->x * inv * sHalfW;
-            sSY[i] = o->y * inv * sHalfH;
+            float inv = 1.f / cw;
+            sSX[i] = cx * inv * hw;
+            sSY[i] = cy * inv * hh;
         }
     }
     fe_stat_vertices_in += n;
     fe_stat_triangles_in += count / 3;
     if (all) return;                                    /* the whole mesh is off one side */
+    const int cull = s.cull;
+    const float min_area2 = s.min_area2;
     for (int i = 0; i + 2 < count; i += 3) {
         unsigned ia = idx ? idx[i] : (unsigned)(first + i), ib = idx ? idx[i + 1] : (unsigned)(first + i + 1),
                  ic = idx ? idx[i + 2] : (unsigned)(first + i + 2);
         uint8_t ca = sCode[ia], cb = sCode[ib], cc = sCode[ic];
         if (ca & cb & cc) continue;
-        uint8_t any = ca | cb | cc;
-        if (!any) {
-            emit(&s, &sVtx[ia], &sVtx[ib], &sVtx[ic], sSX[ia], sSY[ia], sSX[ib], sSY[ib], sSX[ic], sSY[ic]);
+        uint8_t fa = sFogged[ia], fb = sFogged[ib], fc = sFogged[ic];
+        if (fa & fb & fc & 2) continue;                 /* lost in the fog */
+        int fogged = (fa | fb | fc) != 0;
+        if (!(ca | cb | cc)) {
+            float ax = sSX[ia], ay = sSY[ia];
+            float area2 = (sSX[ib] - ax) * (sSY[ic] - ay) - (sSX[ic] - ax) * (sSY[ib] - ay);    /* pixels, y up */
+            if (cull && area2 >= 0.f) continue;         /* front faces are clockwise */
+            if (area2 < 0.f) area2 = -area2;
+            if (!(area2 >= min_area2)) { fe_stat_tiny++; continue; }    /* also rejects NaN */
+            Batch *bt = target(&s, fogged);
+            OutVtx *v = bt ? reserve(bt) : NULL;
+            if (!v) continue;
+            v[0] = sOut[ia]; v[1] = sOut[ib]; v[2] = sOut[ic];
+            fe_stat_fogged += fogged;
             continue;
         }
+        /* crosses the edge of the view: clip to every plane it crosses */
         Vtx bufa[10], bufb[10], *in = bufa, *out = bufb;
-        int m = 3;
-        in[0] = sVtx[ia]; in[1] = sVtx[ib]; in[2] = sVtx[ic];
-        for (int bit = 0; bit < 6 && m >= 3; bit++) {
+        uint8_t any = ca | cb | cc;
+        int k = 3;
+        unpack(&in[0], &sOut[ia]); unpack(&in[1], &sOut[ib]); unpack(&in[2], &sOut[ic]);
+        for (int bit = 0; bit < 6 && k >= 3; bit++) {
             if (!(any & (1 << bit))) continue;
-            m = clip_plane(in, m, out, bit);
+            k = clip_plane(in, k, out, bit);
             Vtx *t = in; in = out; out = t;
         }
         fe_stat_clipped++;
-        if (m < 3) continue;
+        if (k < 3) continue;
         float sx[10], sy[10];
-        for (int k = 0; k < m; k++) {
-            float inv = 1.f / in[k].w;
-            sx[k] = in[k].x * inv * sHalfW;
-            sy[k] = in[k].y * inv * sHalfH;
+        for (int j = 0; j < k; j++) {
+            float inv = 1.f / in[j].w;
+            sx[j] = in[j].x * inv * hw;
+            sy[j] = in[j].y * inv * hh;
         }
-        for (int k = 1; k + 1 < m; k++)
-            emit(&s, &in[0], &in[k], &in[k + 1], sx[0], sy[0], sx[k], sy[k], sx[k + 1], sy[k + 1]);
+        for (int j = 1; j + 1 < k; j++) {
+            float area2 = (sx[j] - sx[0]) * (sy[j + 1] - sy[0]) - (sx[j + 1] - sx[0]) * (sy[j] - sy[0]);
+            if (cull && area2 >= 0.f) continue;
+            if (area2 < 0.f) area2 = -area2;
+            if (!(area2 >= min_area2)) { fe_stat_tiny++; continue; }
+            Batch *bt = target(&s, fogged);
+            OutVtx *v = bt ? reserve(bt) : NULL;
+            if (!v) continue;
+            const Vtx *tri[3] = { &in[0], &in[j], &in[j + 1] };
+            for (int t = 0; t < 3; t++) {
+                const Vtx *p = tri[t];
+                v[t].x = p->x; v[t].y = p->y; v[t].z = p->z; v[t].w = p->w;
+                v[t].u0 = p->u0; v[t].v0 = p->v0; v[t].u1 = p->u1; v[t].v1 = p->v1;
+                v[t].color = byte_of(p->r) | byte_of(p->g) << 8 | byte_of(p->b) << 16 | byte_of(p->a) << 24;
+            }
+            fe_stat_fogged += fogged;
+        }
     }
+}
+
+static void draw(int count, const uint16_t *idx, int first) {
+    uint64_t t0 = plat_time_us();
+    draw_triangles(count, idx, first);
+    fe_time_transform_us += (unsigned)(plat_time_us() - t0);
 }
 
 void fe_draw_elements(uint32_t mode, int count, uint32_t type, uint32_t indices) {
@@ -527,11 +548,14 @@ void fe_frame_begin(int panel_w, int panel_h) {
     fe_stat_draws = fe_stat_vertices_in = fe_stat_triangles_in = fe_stat_triangles_out = fe_stat_tiny = 0;
     fe_stat_clipped = fe_stat_dropped = fe_stat_calls = fe_stat_fogged = 0;
     fe_time_transform_us = fe_time_submit_us = 0;
+    uint64_t t0 = plat_time_us();
     glViewport(0, 0, panel_w, panel_h);
     glClearColor(sClear[0], sClear[1], sClear[2], sClear[3]);
     glClearDepthf(1.f);
     glDepthMask(GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    fe_time_clear_us = (unsigned)(plat_time_us() - t0);
+    fe_time_first_draw_us = 0;
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glShadeModel(GL_SMOOTH);
@@ -567,6 +591,11 @@ static void draw_batch(const Batch *b, int index) {
         int n = k + 1 == b->chunks ? b->last : CHUNK_VERTS;
         if (!n) continue;
         CRUMB("arrays", (uint32_t)(b->chunk[k] << 16) | (uint32_t)n);
+        if (!fe_stat_draws) {
+            uint64_t t0 = plat_time_us();
+            glDrawArrays(GL_TRIANGLES, b->chunk[k] * CHUNK_VERTS, n);
+            fe_time_first_draw_us = (unsigned)(plat_time_us() - t0);
+        } else
         glDrawArrays(GL_TRIANGLES, b->chunk[k] * CHUNK_VERTS, n);
         fe_stat_draws++;
         fe_stat_triangles_out += n / 3;

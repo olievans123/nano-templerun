@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
             (unsigned)rt_heap_used(), fe_buffer_bytes);
     long tris = 0, tiny = 0, clipped = 0, dropped = 0, fogged = 0, draws = 0;
     int runs = 0, last_state = GAME_TITLE, best = 0;
-    game_autopilot(1);
+    game_autopilot(getenv("TR_NOAUTO") ? 0 : 1);
 
     uint64_t t0 = plat_time_us();
     for (int f = 0; f < frames; f++) {

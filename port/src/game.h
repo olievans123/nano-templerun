@@ -12,6 +12,8 @@ void game_touch(int phase, float x, float y);
 /* Tilt: the sideways part of gravity, -1 (left edge down) to 1. */
 void game_tilt(float x);
 
+/* With drawing off a frame only clears the screen (the engine still advances). */
+void game_set_drawing(int on);
 /* Let the shell play by itself (for soak tests and demonstrations). */
 void game_autopilot(int on);
 

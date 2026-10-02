@@ -236,7 +236,7 @@ void rt_host_sound(const char *name,int loop,float pitch,int stop){(void)name;(v
 #define BEAT_US 33333u
 #define ENGINE_HEAP 0x110000u
 static uint32_t gap_short=5200,gap_long=8600,gap_estimate=6500;
-static struct { uint32_t frames,max_period,max_work,over40,triangles,draws,dropped,vertices;uint64_t period,work,engine,draw,transform,submit; } perf;
+static struct { uint32_t frames,max_period,max_work,over40,triangles,draws,dropped,vertices;uint64_t period,work,engine,draw,transform,submit,clear,first; } perf;
 extern unsigned fe_time_draw_us;
 
 void tr_nano_frame(int w,int h,uint32_t frame) {
@@ -294,6 +294,11 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     float tilt=(float)-g[0]*0.001f;                     /* the phone reports gravity; the nano the opposite */
     game_tilt(tilt>1.f?1.f:tilt<-1.f?-1.f:tilt);
 
+    /* Ease in: once, the very first frame drawn after loading rebooted the iPod, while the
+     * same frame a few seconds later never has. So the first frames after the textures go
+     * up only clear the screen, and the next ones draw without the fog blending. */
+    game_set_drawing(count>=4);
+    fe_option_fog_blend=count>=24;
     port_crumb("heap",hb_os_heap_free(),0);
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();
@@ -302,7 +307,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     port_crumb("drawn",count++,0);
     if(last!=now)period=0;
     perf.frames++;perf.period+=period;perf.work+=work;perf.engine+=(uint32_t)(fe_time_engine_us);
-    perf.draw+=fe_time_draw_us;perf.transform+=fe_time_transform_us;perf.submit+=fe_time_submit_us;perf.vertices+=(uint32_t)fe_stat_vertices_in;
+    perf.draw+=fe_time_draw_us;perf.transform+=fe_time_transform_us;perf.submit+=fe_time_submit_us;perf.clear+=fe_time_clear_us;perf.first+=fe_time_first_draw_us;perf.vertices+=(uint32_t)fe_stat_vertices_in;
     perf.triangles+=(uint32_t)fe_stat_triangles_out;perf.draws+=(uint32_t)fe_stat_draws;perf.dropped+=(uint32_t)fe_stat_dropped;
     if(period>perf.max_period)perf.max_period=period;
     if(work>perf.max_work)perf.max_work=work;
@@ -322,9 +327,9 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     if(reports<8 && seconds>=marks[reports] && perf.frames) {
         reports++;
         uint32_t fps10=perf.period?(uint32_t)((uint64_t)perf.frames*10000000u/perf.period):0;
-        plat_log("%u s: %u frames, %u.%u fps, work %u us = simulate %u + draw %u (of which transform %u) + submit %u; max work %u, max period %u, over 40 ms %u; per frame %u vertices in, %u triangles out, %u draws; dropped %u; state %d, distance %d; heap free %u, engine heap %u",
+        plat_log("%u s: %u frames, %u.%u fps, work %u us = simulate %u + draw %u (of which transform %u) + submit %u (first call %u) + clear %u; max work %u, max period %u, over 40 ms %u; per frame %u vertices in, %u triangles out, %u draws; dropped %u; state %d, distance %d; heap free %u, engine heap %u",
                  (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),
-                 (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),perf.max_work,
+                 (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),(unsigned)(perf.first/perf.frames),(unsigned)(perf.clear/perf.frames),perf.max_work,
                  perf.max_period,perf.over40,perf.vertices/perf.frames,perf.triangles/perf.frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
                  hb_os_heap_free(),(unsigned)rt_heap_peak());
         flush_log();

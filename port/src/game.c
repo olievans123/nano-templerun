@@ -96,6 +96,8 @@ void game_touch(int phase, float x, float y) {
 }
 
 void game_tilt(float x) { sTilt = x; }
+static int sDrawing = 1;
+void game_set_drawing(int on) { sDrawing = on; }
 
 /* ---- autopilot: plays through the same touch calls a finger makes ---------------------------- */
 #define PLAYER_OFFSET 0x198
@@ -172,6 +174,7 @@ void game_frame(float dt) {
     fe_time_engine_us = (uint32_t)(plat_time_us() - t0);
     CRUMB("clear");
     fe_frame_begin(sW, sH);
+    if (!sDrawing) return;
     CRUMB("draw");
     t0 = plat_time_us();
     rt_invoke(fDraw, 1, sGame);
