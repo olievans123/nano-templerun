@@ -6,7 +6,7 @@ ARCH := -marm -mcpu=cortex-a5 -mfloat-abi=softfp -mfpu=vfpv3-d16 -mword-relocati
 CFLAGS := $(ARCH) -O2 -ffp-contract=off -std=gnu99 -Wall -ffunction-sections -fdata-sections \
           -fno-common -fno-strict-aliasing -fno-builtin -MMD -MP -DAB_NANO -DPORT_ARENA_SIZE=0x300000u \
           -I$(NANOAPPS)/sdk -I../src
-ENGINE := mesh tex scene_test
+ENGINE := mesh tex r3d scene_test
 PLATFORM := nano_platform nano_alloc nano_libc nano_memory
 OBJS := $(ENGINE:%=$(BUILD)/src/%.o) $(PLATFORM:%=$(BUILD)/nano/%.o)
 all: $(BUILD)/libtr_nano.a

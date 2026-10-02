@@ -11,6 +11,7 @@
 #include "../src/platform.h"
 #include "../src/scene_test.h"
 #include "../src/tex.h"
+#include "../src/r3d.h"
 
 #define DATA_DIR "/Apps/Data/TempleRun"
 #define MAX_FILES 256
@@ -132,9 +133,9 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
 /* Each mode runs for PHASE_US; a line is logged as each one ends (three writes in all),
  * then the full scene carries on. */
 #define PHASE_US 3000000u
-#define PHASES 4
-/* the scene mode of each phase: with lightmap, without, with again, track only */
-static const uint8_t phase_mode[PHASES]={0,1,0,2};
+#define PHASES 2
+/* the scene mode of each phase: with lightmap, without */
+static const uint8_t phase_mode[PHASES]={0,1};
 static struct { uint32_t frames,max_period,work_max,over33;uint64_t period,work; } phase[PHASES];
 
 void tr_nano_frame(int w,int h,uint32_t frame) {
@@ -172,9 +173,10 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
             uint32_t n=phase[i].frames?phase[i].frames:1;
             uint32_t fps10=phase[i].period?(uint32_t)((uint64_t)phase[i].frames*10000000u/phase[i].period):0;
             port_crumb("log",(uint32_t)i,0);
-            plat_log("phase %d mode %d: frames=%u fps=%u.%u work_us=%u work_max=%u period_max=%u over_33ms=%u; %d draws, %d vertices",
+            plat_log("phase %d mode %d: frames=%u fps=%u.%u work_us=%u work_max=%u period_max=%u over_33ms=%u; %d draws, %d vertices in, %d triangles out, %d tiny, %d clipped",
                      i,(int)phase_mode[i],phase[i].frames,fps10/10,fps10%10,(unsigned)(phase[i].work/n),phase[i].work_max,
-                     phase[i].max_period,phase[i].over33,scene_stat_draws,scene_stat_vertices);
+                     phase[i].max_period,phase[i].over33,scene_stat_draws,scene_stat_vertices,scene_stat_triangles,
+                     r3d_stat_tiny,r3d_stat_clipped);
             port_crumb("flush",(uint32_t)i,0);
             port_log_flush(DATA_DIR "/log.txt");
             port_crumb("flushed",(uint32_t)i,0);
@@ -186,6 +188,17 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     last=plat_time_us();now=last;        /* a log write above must not count as a frame */
     float dt=period?(float)period*1e-6f:1.f/30.f;
     if(dt>0.1f)dt=0.1f;
+    /* two more lines if it keeps running: the crash this build is meant to cure came at random */
+    {
+        static int alive;
+        uint32_t seconds=now>start?(uint32_t)((now-start)/1000000u):0;
+        if(reported && alive<2 && seconds>=(alive?90u:30u)) {
+            alive++;
+            plat_log("still running after %u s, %u frames",(unsigned)seconds,(unsigned)count);
+            port_log_flush(DATA_DIR "/log.txt");
+            last=0;
+        }
+    }
     port_crumb("draw",(count<<4)|(uint32_t)mode,0);
     scene_frame(w,h,dt,mode);
     port_crumb("drawn",count++,0);

@@ -7,6 +7,7 @@
 #include "platform.h"
 #include "mesh.h"
 #include "tex.h"
+#include "r3d.h"
 #include "scene_test.h"
 
 #ifndef GL_TEXTURE1
@@ -46,44 +47,17 @@ int scene_init(void) {
     sTreeTex = tex_load("treeTexture");
     sPlayerTex = tex_load("playerTexture");
     sEnemyTex = tex_load("enemyTexture");
+    r3d_init();
     plat_log("scene: textures %u %u %u %u %u, %u KiB", sWall, sLight, sTreeTex, sPlayerTex, sEnemyTex, tex_bytes / 1024u);
     return sWall && sPlayerTex ? 0 : -1;
 }
 
 static void draw(const TRMesh *m, int frame, unsigned base, unsigned light, float x, float y, float z, float scale) {
-    const TRFrame *f = &m->frames[frame];
-    const uint8_t *v = m->vertices + (size_t)f->vertex_start * (size_t)m->vertex_size;
-    float matrix[16] = { scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 0, x, y, z, 1 };
-    glVertexPointer(3, GL_FLOAT, m->vertex_size, v + m->pos_offset);
-    glActiveTexture(GL_TEXTURE1);
-    glClientActiveTexture(GL_TEXTURE1);
-    if (light && m->uv_count > 1) {
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, light);
-        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-        glTexCoordPointer(2, GL_FLOAT, m->vertex_size, v + m->uv_offset[1]);
-    } else {
-        glDisable(GL_TEXTURE_2D);
-        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    }
-    glActiveTexture(GL_TEXTURE0);
-    glClientActiveTexture(GL_TEXTURE0);
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, base);
-    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glTexCoordPointer(2, GL_FLOAT, m->vertex_size, v + m->uv_offset[0]);
-    glPushMatrix();
-    glMultMatrixf(matrix);
-    glDrawElements(GL_TRIANGLES, f->index_count, GL_UNSIGNED_SHORT, m->indices + f->index_start);
-    glPopMatrix();
-    scene_stat_draws++;
-    scene_stat_vertices += f->vertex_count;
-    scene_stat_triangles += f->index_count / 3;
+    float model[16] = { scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 0, x, y, z, 1 };
+    r3d_mesh(m, frame, model, base, light, 1);
 }
 
 void scene_frame(int w, int h, float dt, int mode) {
-    scene_stat_draws = scene_stat_vertices = scene_stat_triangles = 0;
     sDistance += 100.f * dt;
     sAnim += 12.f * dt;
     if (sAnim >= 12000.f) sAnim -= 12000.f;
@@ -97,28 +71,19 @@ void scene_frame(int w, int h, float dt, int mode) {
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glDisable(GL_BLEND);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_FRONT);                   /* the models' front faces are clockwise */
     glShadeModel(GL_SMOOTH);
-    glColor4f(1.f, 1.f, 1.f, 1.f);
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glDisableClientState(GL_COLOR_ARRAY);
-    glDisableClientState(GL_NORMAL_ARRAY);
 
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
     float near = 1.f, far = 400.f, top = near * 0.46630766f /* tan(25 deg) */, right = top * (float)w / (float)h;
-    glFrustumf(-right, right, -top, top, near, far);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
+    float projection[16] = { near / right, 0, 0, 0, 0, near / top, 0, 0,
+                             0, 0, -(far + near) / (far - near), -1, 0, 0, -2.f * far * near / (far - near), 0 };
     /* camera 50 behind and 35 above the runner, looking 20 above them */
     float eye[3] = { 0, 35, runner_z + 50 };
     float fwd[3] = { 0, -0.28734788f, -0.95782629f };       /* (0, 20 - 35, -50), normalised */
     /* side = (1,0,0), up = side x fwd */
     float up[3] = { 0, -fwd[2], fwd[1] };
-    float view[16] = { 1, up[0], 0, 0, 0, up[1], -fwd[1], 0, 0, up[2], -fwd[2], 0, 0, 0, 0, 1 };
-    glMultMatrixf(view);
-    glTranslatef(-eye[0], -eye[1], -eye[2]);
+    float view[16] = { 1, up[0], 0, 0, 0, up[1], -fwd[1], 0, 0, up[2], -fwd[2], 0,
+                       -eye[0], -(up[1] * eye[1] + up[2] * eye[2]), fwd[1] * eye[1] + fwd[2] * eye[2], 1 };
+    r3d_begin(w, h, projection, view);
 
     int first = (int)(sDistance / 60.f) - 1;
     for (int i = first; i < first + 8; i++) {
@@ -134,12 +99,9 @@ void scene_frame(int w, int h, float dt, int mode) {
             draw(sEnemy, ((int)sAnim + i * 5) % sEnemy->frame_count, sEnemyTex, 0, -8.f + 8.f * (float)i, 0,
                  runner_z + 20.f + 4.f * (float)(i & 1), 1.f);
     }
-    glActiveTexture(GL_TEXTURE1);
-    glClientActiveTexture(GL_TEXTURE1);
-    glDisable(GL_TEXTURE_2D);
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    glActiveTexture(GL_TEXTURE0);
-    glClientActiveTexture(GL_TEXTURE0);
-    glDisable(GL_CULL_FACE);
+    r3d_end();
+    scene_stat_draws = r3d_stat_draws;
+    scene_stat_vertices = r3d_stat_vertices_in;
+    scene_stat_triangles = r3d_stat_triangles_out;
     glDisable(GL_DEPTH_TEST);
 }
