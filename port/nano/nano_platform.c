@@ -240,12 +240,34 @@ void rt_host_sound(const char *name,int loop,float pitch,int stop){(void)name;(v
 #define TOUCH_QUEUE 24
 static struct { int16_t x,y;uint8_t down; } touch_queue[TOUCH_QUEUE];
 static int touch_count,touch_last_down;static int16_t touch_last_x,touch_last_y;
-static uint32_t touch_presses;
+static uint32_t touch_presses;static int touch_report;
+/* The finger from the OS's own touch list (looked at, not altered). The resident's mailbox
+ * is only refreshed when the UI task gets round to its touch events, and this game's long
+ * frames leave it little time; the list itself is filled by the touch driver. */
+#define OS_TOUCH_HEAD ((volatile uint32_t *)0x089a5298u)
+static uint32_t touch_from_list,touch_from_mailbox;
+static int list_touch(int16_t *x,int16_t *y) {
+    volatile uint32_t *head=OS_TOUCH_HEAD;
+    if(head[5]==0)return 0;
+    uint32_t end=head[4];
+    if(end<0x08000000u||end>=0x10000000u)return 0;
+    uint32_t first=*(volatile uint32_t *)end;
+    if(first==end||first<0x08000000u||first>=0x10000000u)return 0;
+    volatile int32_t *value=(volatile int32_t *)(first+8);
+    if(*((volatile uint8_t *)(first+8)+4)==1)return 0;          /* status 1: lifted */
+    *x=(int16_t)value[2];*y=(int16_t)value[3];
+    return 1;
+}
 void plat_poll(void) {
     hb_spoint_t f;hb_surface_touch_read(&f);
     int down=f.down!=0;
+    if(down)touch_from_mailbox++;
+    else if(list_touch(&f.x,&f.y)){down=1;touch_from_list++;}
     if(down==touch_last_down && (!down || (f.x==touch_last_x && f.y==touch_last_y)))return;
-    if(down && !touch_last_down)touch_presses++;
+    if(down && !touch_last_down) {
+        touch_presses++;
+        if(touch_presses<=3)touch_report=1;              /* the first few are logged, to check input on hardware */
+    }
     touch_last_down=down;touch_last_x=f.x;touch_last_y=f.y;
     if(touch_count<TOUCH_QUEUE) {
         touch_queue[touch_count].x=f.x;touch_queue[touch_count].y=f.y;touch_queue[touch_count].down=(uint8_t)down;touch_count++;
@@ -292,7 +314,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
             plat_log("initialization failed");flush_log();failed=1;fatal_armed=0;return;
         }
         initialized=1;
-        port_crumb("heap1",hb_os_heap_free(),0);
+        port_crumb("heap1",hb_os_heap_free(),hb_os_heap_largest());
         plat_log("loaded in %u ms: heap free %u, largest %u; engine heap %u of %u; models %u; textures %u",
                  (unsigned)((plat_time_us()-t0)/1000u),hb_os_heap_free(),hb_os_heap_largest(),(unsigned)rt_heap_peak(),ENGINE_HEAP,
                  fe_buffer_bytes,(unsigned)texture_bytes);
@@ -316,6 +338,12 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         else if(touching){game_touch(2,(float)touch_queue[i].x,(float)touch_queue[i].y);touching=0;}
     }
     touch_count=0;
+    if(touch_report) {
+        touch_report=0;
+        plat_log("press %u at %d,%d (mailbox %u, list %u samples); state %d",(unsigned)touch_presses,(int)touch_last_x,(int)touch_last_y,
+                 (unsigned)touch_from_mailbox,(unsigned)touch_from_list,game_state());
+        flush_log();last=0;
+    }
     port_crumb("input",count,0);
     int32_t g[3]={0,0,0};hb_accel_read_milli_g(g);
     float tilt=(float)-g[0]*0.001f;                     /* the phone reports gravity; the nano the opposite */
@@ -326,7 +354,7 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
      * up only clear the screen, and the next ones draw without the fog blending. */
     game_set_drawing(count>=4);
     fe_option_fog_blend=count>=90;
-    port_crumb("heap",hb_os_heap_free(),0);
+    port_crumb("heap",hb_os_heap_free(),hb_os_heap_largest());
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();
     game_frame((float)(period>250000u?250000u:period)*1e-6f);
@@ -358,9 +386,9 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
                  (unsigned)seconds,perf.frames,fps10/10,fps10%10,(unsigned)(perf.work/perf.frames),(unsigned)(perf.engine/perf.frames),
                  (unsigned)(perf.draw/perf.frames),(unsigned)(perf.transform/perf.frames),(unsigned)(perf.submit/perf.frames),
                  (unsigned)(perf.first/perf.frames),perf.max_work,perf.max_period,perf.over40);
-        plat_log("  per frame %u vertices in, %u triangles out, %u draws; dropped %u; state %d, distance %d, presses %u; heap free %u, engine heap %u",
+        plat_log("  per frame %u vertices in, %u triangles out, %u draws; dropped %u; state %d, distance %d, presses %u (mailbox %u, list %u); heap free %u, engine heap %u",
                  perf.vertices/perf.frames,perf.triangles/perf.frames,perf.draws/perf.frames,perf.dropped,game_state(),game_distance(),
-                 (unsigned)touch_presses,hb_os_heap_free(),(unsigned)rt_heap_peak());
+                 (unsigned)touch_presses,(unsigned)touch_from_mailbox,(unsigned)touch_from_list,hb_os_heap_free(),(unsigned)rt_heap_peak());
         flush_log();
         memset(&perf,0,sizeof perf);
         last=0;

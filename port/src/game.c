@@ -37,7 +37,7 @@ static void port_test_mark(int test) { (void)test; }
 static uint32_t sGame, sScratch;
 static uint32_t fSimulate, fDraw, fStart, fRestart, fTouchBegan, fTouchMoved, fTouchEnded, fTilt, fIsGameOver,
                 fIsGameOverFinished, fGetScore, fGetCoins, fGetDistance, fIsPaused, fUnpause;
-static int sW, sH, sState, sTouching, sRuns;
+static int sW, sH, sState, sTouching, sRuns, sWaitLift;
 static uint32_t fGetDeathType;
 static float sTilt;
 /* The engine sizes its on-screen display for a screen 320 points wide; it has one scale for
@@ -97,11 +97,13 @@ static void begin_run(void) {
 }
 
 void game_touch(int phase, float x, float y) {
-    if (sState != GAME_RUNNING) {
-        if (phase == 2 && sTouching) begin_run();
-        sTouching = phase != 2;
+    if (sState != GAME_RUNNING) {                       /* any touch starts a run, once the last one has lifted */
+        if (phase == 0 && !sWaitLift) { begin_run(); sWaitLift = 1; }
+        if (phase == 2) sWaitLift = 0;
+        sTouching = 0;
         return;
     }
+    if (sWaitLift) { if (phase == 2) sWaitLift = 0; return; }       /* the finger that started the run */
     if (phase == 2 && rt_invoke(fIsPaused, 1, sGame)) {            /* any tap resumes */
         rt_invoke(fUnpause, 1, sGame);
         sTouching = 0;
