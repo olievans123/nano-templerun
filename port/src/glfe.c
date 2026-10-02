@@ -238,6 +238,10 @@ int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_triangles_
     fe_stat_dropped, fe_stat_calls, fe_stat_fogged, fe_stat_outside;
 
 unsigned fe_time_engine_us;
+/* Switches for finding what the nano's driver accepts: draw fogged triangles blended (1) or
+ * plain (0); the smallest single-texture triangle kept, as twice its area in pixels. */
+int fe_option_fog_blend = 1;
+float fe_option_min_area2 = 0.25f;
 int fe_peak_vertices, fe_peak_chunks, fe_peak_batches;   /* the most one draw call, one frame have needed */
 static Batch *batch_for(int kind, unsigned tex0, unsigned tex1, int blend, int depth_test, int depth_mask) {
     if (kind == ORDERED) {
@@ -333,7 +337,7 @@ static uint32_t pack_color(const Vtx *v, float scale) {
     return R | G << 8 | B << 16 | A << 24;      /* bytes in memory: r, g, b, a */
 }
 
-typedef struct { unsigned tex0, tex1; int fogged_scene, cull; float min_area2; } DrawState;
+typedef struct { unsigned tex0, tex1; int fogged_scene, fog_blend, cull; float min_area2; } DrawState;
 
 static void emit(const DrawState *s, const Vtx *a, const Vtx *b, const Vtx *c,
                  float ax, float ay, float bx, float by, float cx, float cy) {
@@ -344,7 +348,7 @@ static void emit(const DrawState *s, const Vtx *a, const Vtx *b, const Vtx *c,
     Batch *bt;
     int fogged = 0;
     if (s->fogged_scene) {
-        fogged = a->fog < 0.998f || b->fog < 0.998f || c->fog < 0.998f;
+        fogged = s->fog_blend && (a->fog < 0.998f || b->fog < 0.998f || c->fog < 0.998f);
         if (fogged && a->fog <= 0.002f && b->fog <= 0.002f && c->fog <= 0.002f) return;    /* lost in the fog */
         bt = batch_for(fogged ? FOGGED : OPAQUE, s->tex0, s->tex1, fogged, 1, 1);
         fe_stat_fogged += fogged;
@@ -410,10 +414,11 @@ static void draw(int count, const uint16_t *idx, int first) {
     if (!s.tex1) { uv1 = NULL; pk1 = -1; }
     const uint8_t *col = sColorArray.enabled ? array_base(&sColorArray) : NULL;
     s.fogged_scene = sFog && !sBlend && sDepthTest && sDepthMask;
+    s.fog_blend = fe_option_fog_blend;
     s.cull = sCull;
     /* With two texture units the driver reboots on small triangles; 2 square pixels is safe.
      * (Twice the area is compared.) Zero-area triangles are never safe. */
-    s.min_area2 = s.tex1 ? 4.0f : 0.25f;
+    s.min_area2 = s.tex1 ? 4.0f : fe_option_min_area2;
 
     float mvp[16];
     const float *mv = sModelView[sModelViewTop];

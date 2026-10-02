@@ -47,6 +47,8 @@ void fe_frame_begin(int panel_w, int panel_h);      /* clears; the engine's draw
 void fe_frame_end(void);                            /* hands the frame's triangles to OpenGL */
 extern int fe_stat_draws, fe_stat_vertices_in, fe_stat_triangles_in, fe_stat_triangles_out, fe_stat_tiny,
            fe_stat_clipped, fe_stat_dropped, fe_stat_calls, fe_stat_fogged;
+extern int fe_option_fog_blend;
+extern float fe_option_min_area2;
 extern unsigned fe_time_engine_us;                  /* the last frame's time in the engine's simulate() */
 extern int fe_peak_vertices, fe_peak_chunks, fe_peak_batches;
 extern unsigned fe_buffer_bytes;                    /* memory held for the engine's buffer objects */

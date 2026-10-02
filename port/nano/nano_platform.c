@@ -26,10 +26,20 @@ uint64_t plat_time_us(void) {
     uint32_t now=hb_time_uptime_us();if(now<last)high+=1ull<<32;last=now;return high|now;
 }
 /* Same aligned, oversized read pattern used by the tested nano game ports. */
+/* File buffers come straight from the OS heap and go back as soon as the file is used, so
+ * the arena need not have room for the largest file. The header before the data is the one
+ * the arena's free() reads to find where a block came from. */
+typedef struct { void *base; uint32_t size, pad[2]; } alloc_header;
+static void *os_buffer(uint32_t cap) {
+    unsigned char *raw=hb_os_alloc(cap+64u);if(!raw)return NULL;
+    unsigned char *p=(unsigned char *)(((uintptr_t)raw+16u+63u)&~(uintptr_t)63u);
+    alloc_header *h=(alloc_header *)(void *)p-1;h->base=raw;h->size=cap;
+    return p;
+}
 static void *read_file(const char *path,uint32_t expected,uint32_t *size) {
     if(expected>4u*1024u*1024u)return NULL;
     uint32_t cap=((expected+1u+4095u)&~4095u)+4096u;
-    unsigned char *data=memalign(64,cap);if(!data)return NULL;
+    unsigned char *data=os_buffer(cap);if(!data)return NULL;
     uint32_t got=hb_fs_read(path,data,cap);
     if(!got||got>expected){free(data);return NULL;}
     data[got]=0;if(size)*size=got;return data;
@@ -216,6 +226,7 @@ void rt_host_sound(const char *name,int loop,float pitch,int stop){(void)name;(v
 /* The engine advances by the time that has really passed (as on the phone), so the frame
  * rate only sets how smooth it looks. Frames are held to a 30 Hz beat when the work fits. */
 #define BEAT_US 33333u
+#define ENGINE_HEAP 0x110000u
 static uint32_t gap_short=5200,gap_long=8600,gap_estimate=6500;
 static struct { uint32_t frames,max_period,max_work,over40,triangles,draws,dropped;uint64_t period,work,engine; } perf;
 
@@ -243,12 +254,14 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         if(manifest()){plat_log("files.lst is missing");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;}
         flag=plat_read_file("autopilot.txt",&marker,1);
         if(flag){free(flag);game_autopilot(1);plat_log("autopilot on");}
-        if(!game_init(w,h,0x130000u,hb_time_uptime_us()|1u)) {
+        port_crumb("heap0",hb_os_heap_free(),0);
+        if(!game_init(w,h,ENGINE_HEAP,hb_time_uptime_us()|1u)) {
             plat_log("initialization failed");port_log_flush(DATA_DIR "/log.txt");failed=1;fatal_armed=0;return;
         }
         initialized=1;
+        port_crumb("heap1",hb_os_heap_free(),0);
         plat_log("loaded in %u ms: heap free %u, largest %u; engine heap %u of %u; models %u; textures %u",
-                 (unsigned)((plat_time_us()-t0)/1000u),hb_os_heap_free(),hb_os_heap_largest(),(unsigned)rt_heap_peak(),0x130000u,
+                 (unsigned)((plat_time_us()-t0)/1000u),hb_os_heap_free(),hb_os_heap_largest(),(unsigned)rt_heap_peak(),ENGINE_HEAP,
                  fe_buffer_bytes,(unsigned)texture_bytes);
         port_log_flush(DATA_DIR "/log.txt");
         last=0;previous_end=0;started=plat_time_us();
@@ -272,6 +285,19 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
     float tilt=(float)-g[0]*0.001f;                     /* the phone reports gravity; the nano the opposite */
     game_tilt(tilt>1.f?1.f:tilt<-1.f?-1.f:tilt);
 
+    /* First runs on hardware: bring the drawing features in one at a time, so that a reboot's
+     * trail says which one the driver objected to. */
+    {
+        static int stage=-1;
+        int now_stage=count<90?0:count<180?1:2;
+        if(now_stage!=stage) {
+            stage=now_stage;
+            fe_option_fog_blend=stage>=1;
+            fe_option_min_area2=stage>=2?0.25f:4.0f;
+            port_crumb("stage",(uint32_t)stage,0);
+        }
+    }
+    port_crumb("heap",hb_os_heap_free(),0);
     port_crumb("frame",count,0);
     uint64_t t1=plat_time_us();
     game_frame((float)(period>250000u?250000u:period)*1e-6f);

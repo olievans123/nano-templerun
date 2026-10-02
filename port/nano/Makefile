@@ -7,7 +7,7 @@ ARCH := -marm -mcpu=cortex-a5 -mfloat-abi=softfp -mfpu=vfpv3-d16 -mword-relocati
 # the guest stack pointer and memory base in r10 and r11; see port/src/rt.h.
 RECOMP ?= $(HOME)/nano-tr/recomp
 CFLAGS := $(ARCH) -O2 -ffp-contract=off -std=gnu99 -Wall -ffunction-sections -fdata-sections \
-          -fno-common -fno-strict-aliasing -fwrapv -fno-builtin -MMD -MP -DAB_NANO -DPORT_ARENA_SIZE=0x3e0000u \
+          -fno-common -fno-strict-aliasing -fwrapv -fno-builtin -MMD -MP -DAB_NANO -DPORT_ARENA_SIZE=0x330000u \
           -I$(NANOAPPS)/sdk -I../src -I$(RECOMP)
 ENGINE := game glfe rt rt_gl
 PLATFORM := nano_platform nano_alloc nano_libc nano_memory
