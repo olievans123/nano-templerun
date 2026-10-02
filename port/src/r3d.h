@@ -10,6 +10,14 @@
 #define TR_R3D_H
 #include "mesh.h"
 
+/* How the surviving triangles are handed to GL (for finding what the nano's driver accepts). */
+enum {
+    R3D_WORLD = 1,      /* world-space xyz with GL's own matrices, instead of clip-space xyzw */
+    R3D_VBO = 2,        /* upload the frame to a buffer object, instead of client arrays */
+    R3D_SMALL = 4,      /* at most 384 vertices per draw call */
+    R3D_COLOR = 8       /* send a (white) colour array, as the Mario Kart renderer does */
+};
+void r3d_set_mode(int mode);
 void r3d_init(void);
 /* Column-major 4x4 matrices, as OpenGL. */
 void r3d_begin(int panel_w, int panel_h, const float projection[16], const float view[16]);

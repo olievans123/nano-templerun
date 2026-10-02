@@ -80,6 +80,7 @@ int main(int argc, char **argv) {
     glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, rb[1]);
     if (scene_init()) { fprintf(stderr, "scene_init failed\n"); return 1; }
     int frames = argc > 4 ? atoi(argv[4]) : 90;
+    if (argc > 5) { int m = atoi(argv[5]); if (m < 0) scene_indexed = 1; else r3d_set_mode(m); }
     long tiny = 0, clipped = 0, out = 0;
     for (int i = 0; i < frames; i++) {
         /* uneven steps, so the camera lands on many different positions */

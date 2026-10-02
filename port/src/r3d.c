@@ -39,13 +39,19 @@ extern void port_crumb(const char *tag, uint32_t a, uint32_t b);   /* RAM trail 
 #define INSET          0.9990234375f    /* 1 - 1/1024 */
 static float sNearW = 1.015625f, sFarW = 393.75f;       /* set from the projection in r3d_begin */
 
-typedef struct { float x, y, z, w, u0, v0, u1, v1; } Vtx;
+/* Working vertex: clip-space position, texture coordinates, and the world position (sent
+ * instead of the clip position in R3D_WORLD mode). */
+typedef struct { float x, y, z, w, u0, v0, u1, v1, px, py, pz; } Vtx;
+typedef struct { float x, y, z, w, u0, v0, u1, v1; uint32_t color; } OutVtx;   /* what GL is given */
 typedef struct { unsigned tex0, tex1; int used, chunks, chunk[CHUNKS], last; } Batch;   /* last: vertices in the newest chunk */
 
 int r3d_stat_draws, r3d_stat_vertices_in, r3d_stat_triangles_in, r3d_stat_triangles_out, r3d_stat_tiny,
     r3d_stat_clipped, r3d_stat_outside;
 static Batch sBatch[BATCHES];
-static Vtx sPool[CHUNKS * CHUNK_VERTS];
+static OutVtx sPool[CHUNKS * CHUNK_VERTS];
+static int sMode = R3D_VBO;
+static float sProjection[16], sView[16];
+void r3d_set_mode(int mode) { sMode = mode; }
 static int sChunksUsed;
 static GLuint sVbo;
 int r3d_stat_dropped;
@@ -68,6 +74,8 @@ void r3d_init(void) {
 
 void r3d_begin(int panel_w, int panel_h, const float projection[16], const float view[16]) {
     multiply(sViewProj, projection, view);
+    memcpy(sProjection, projection, sizeof sProjection);
+    memcpy(sView, view, sizeof sView);
     /* a perspective matrix: z_clip = A*z_eye + B, w = -z_eye; near = B/(A-1), far = B/(A+1) */
     float A = projection[10], B = projection[14];
     sNearW = B / (A - 1.f) * 1.015625f;
@@ -98,9 +106,13 @@ static void draw_batch(const Batch *b) {
     for (int k = 0; k < b->chunks; k++) {
         int n = k + 1 == b->chunks ? b->last : CHUNK_VERTS;
         if (!n) continue;
-        CRUMB("arrays", (uint32_t)(b->chunk[k] << 16) | (uint32_t)n);
-        glDrawArrays(GL_TRIANGLES, b->chunk[k] * CHUNK_VERTS, n);
-        r3d_stat_draws++;
+        int step = (sMode & R3D_SMALL) ? 384 : CHUNK_VERTS;
+        for (int first = 0; first < n; first += step) {
+            int count = n - first < step ? n - first : step;
+            CRUMB("arrays", (uint32_t)(b->chunk[k] << 16) | (uint32_t)count);
+            glDrawArrays(GL_TRIANGLES, b->chunk[k] * CHUNK_VERTS + first, count);
+            r3d_stat_draws++;
+        }
         r3d_stat_triangles_out += n / 3;
     }
 }
@@ -122,13 +134,13 @@ static Batch *batch_for(unsigned tex0, unsigned tex1) {
 }
 
 /* Room for one more triangle in the batch, or NULL when the frame's pool is full. */
-static Vtx *reserve(Batch *b) {
+static OutVtx *reserve(Batch *b) {
     if (b->last + 3 > CHUNK_VERTS) {
         if (sChunksUsed == CHUNKS) { r3d_stat_dropped++; return NULL; }
         b->chunk[b->chunks++] = sChunksUsed++;
         b->last = 0;
     }
-    Vtx *v = &sPool[b->chunk[b->chunks - 1] * CHUNK_VERTS + b->last];
+    OutVtx *v = &sPool[b->chunk[b->chunks - 1] * CHUNK_VERTS + b->last];
     b->last += 3;
     return v;
 }
@@ -140,11 +152,16 @@ static void emit(Batch *bt, const Vtx *a, const Vtx *b, const Vtx *c,
     if (cull && area2 >= 0.f) return;                                   /* front faces are clockwise */
     if (area2 < 0.f) area2 = -area2;
     if (!(area2 >= 0.25f)) { r3d_stat_tiny++; return; }                 /* also rejects NaN */
-    Vtx *v = reserve(bt);
+    OutVtx *v = reserve(bt);
     if (!v) return;
-    v[0] = *a;
-    v[1] = *b;
-    v[2] = *c;
+    const Vtx *in[3] = { a, b, c };
+    for (int k = 0; k < 3; k++) {
+        const Vtx *p = in[k];
+        if (sMode & R3D_WORLD) { v[k].x = p->px; v[k].y = p->py; v[k].z = p->pz; v[k].w = 1.f; }
+        else { v[k].x = p->x; v[k].y = p->y; v[k].z = p->z; v[k].w = p->w; }
+        v[k].u0 = p->u0; v[k].v0 = p->v0; v[k].u1 = p->u1; v[k].v1 = p->v1;
+        v[k].color = 0xffffffffu;
+    }
 }
 
 /* Signed distance to clip plane `bit` (>= 0 is inside). */
@@ -185,6 +202,8 @@ static int clip_plane(const Vtx *in, int n, Vtx *out, int bit) {
             o->z = p->z + (q->z - p->z) * t;  o->w = p->w + (q->w - p->w) * t;
             o->u0 = p->u0 + (q->u0 - p->u0) * t;  o->v0 = p->v0 + (q->v0 - p->v0) * t;
             o->u1 = p->u1 + (q->u1 - p->u1) * t;  o->v1 = p->v1 + (q->v1 - p->v1) * t;
+            o->px = p->px + (q->px - p->px) * t;  o->py = p->py + (q->py - p->py) * t;
+            o->pz = p->pz + (q->pz - p->pz) * t;
         }
     }
     return count;
@@ -209,6 +228,9 @@ void r3d_mesh(const TRMesh *m, int frame, const float model[16], unsigned tex0, 
         o->y = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
         o->z = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
         o->w = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+        o->px = model[0] * x + model[4] * y + model[8] * z + model[12];
+        o->py = model[1] * x + model[5] * y + model[9] * z + model[13];
+        o->pz = model[2] * x + model[6] * y + model[10] * z + model[14];
         o->u0 = t0[0]; o->v0 = t0[1];
         if (two) {
             const float *t1 = (const float *)(const void *)(src + m->uv_offset[1]);
@@ -266,42 +288,53 @@ void r3d_mesh(const TRMesh *m, int frame, const float model[16], unsigned tex0, 
 void r3d_end(void) {
     if (!sChunksUsed) return;
     glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
+    if (sMode & R3D_WORLD) glLoadMatrixf(sProjection); else glLoadIdentity();
     glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
+    if (sMode & R3D_WORLD) glLoadMatrixf(sView); else glLoadIdentity();
     glDisable(GL_CULL_FACE);                            /* culled above */
     glEnableClientState(GL_VERTEX_ARRAY);
-    glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_NORMAL_ARRAY);
     glColor4f(1.f, 1.f, 1.f, 1.f);
 #ifndef AB_NANO
     /* host check: nothing handed to GL may touch a clip boundary */
-    for (int i = 0; i < BATCHES; i++) {
-        const Batch *bt = &sBatch[i];
-        for (int k = 0; bt->used && k < bt->chunks; k++) {
-            int n = k + 1 == bt->chunks ? bt->last : CHUNK_VERTS;
-            for (int j = 0; j < n; j++) {
-                const Vtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
-                if (!(v->w > 0.f && v->x > -v->w && v->x < v->w && v->y > -v->w && v->y < v->w && v->z > -v->w && v->z < v->w))
-                    r3d_stat_outside++;
+    if (!(sMode & R3D_WORLD))
+        for (int i = 0; i < BATCHES; i++) {
+            const Batch *bt = &sBatch[i];
+            for (int k = 0; bt->used && k < bt->chunks; k++) {
+                int n = k + 1 == bt->chunks ? bt->last : CHUNK_VERTS;
+                for (int j = 0; j < n; j++) {
+                    const OutVtx *v = &sPool[bt->chunk[k] * CHUNK_VERTS + j];
+                    if (!(v->w > 0.f && v->x > -v->w && v->x < v->w && v->y > -v->w && v->y < v->w && v->z > -v->w && v->z < v->w))
+                        r3d_stat_outside++;
+                }
             }
         }
-    }
 #endif
-    if (!sVbo) glGenBuffers(1, &sVbo);
-    if (!sVbo) { plat_log("r3d: no vertex buffer"); return; }
-    CRUMB("buffer", sChunksUsed);
-    glBindBuffer(GL_ARRAY_BUFFER, sVbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)sChunksUsed * CHUNK_VERTS * sizeof(Vtx)), sPool, GL_DYNAMIC_DRAW);
-    glVertexPointer(4, GL_FLOAT, sizeof(Vtx), (const void *)offsetof(Vtx, x));
+    const unsigned char *base = (const unsigned char *)sPool;
+    if (sMode & R3D_VBO) {
+        if (!sVbo) glGenBuffers(1, &sVbo);
+        if (!sVbo) { plat_log("r3d: no vertex buffer"); return; }
+        CRUMB("buffer", sChunksUsed);
+        glBindBuffer(GL_ARRAY_BUFFER, sVbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)sChunksUsed * CHUNK_VERTS * sizeof(OutVtx)), sPool, GL_DYNAMIC_DRAW);
+        base = NULL;
+    }
+    int components = (sMode & R3D_WORLD) ? 3 : 4;
+    glVertexPointer(components, GL_FLOAT, sizeof(OutVtx), base + offsetof(OutVtx, x));
+    if (sMode & R3D_COLOR) {
+        glEnableClientState(GL_COLOR_ARRAY);
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(OutVtx), base + offsetof(OutVtx, color));
+    } else {
+        glDisableClientState(GL_COLOR_ARRAY);
+    }
     glActiveTexture(GL_TEXTURE1);
     glClientActiveTexture(GL_TEXTURE1);
-    glTexCoordPointer(2, GL_FLOAT, sizeof(Vtx), (const void *)offsetof(Vtx, u1));
+    glTexCoordPointer(2, GL_FLOAT, sizeof(OutVtx), base + offsetof(OutVtx, u1));
     glActiveTexture(GL_TEXTURE0);
     glClientActiveTexture(GL_TEXTURE0);
     glEnable(GL_TEXTURE_2D);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glTexCoordPointer(2, GL_FLOAT, sizeof(Vtx), (const void *)offsetof(Vtx, u0));
+    glTexCoordPointer(2, GL_FLOAT, sizeof(OutVtx), base + offsetof(OutVtx, u0));
     for (int i = 0; i < BATCHES; i++)
         if (sBatch[i].used) draw_batch(&sBatch[i]);
     glActiveTexture(GL_TEXTURE1);
@@ -310,6 +343,13 @@ void r3d_end(void) {
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     glActiveTexture(GL_TEXTURE0);
     glClientActiveTexture(GL_TEXTURE0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDisableClientState(GL_COLOR_ARRAY);
+    if (sMode & R3D_VBO) glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (sMode & R3D_WORLD) {
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+    }
     CRUMB("ended", r3d_stat_triangles_out);
 }

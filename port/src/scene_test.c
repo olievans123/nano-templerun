@@ -52,9 +52,43 @@ int scene_init(void) {
     return sWall && sPlayerTex ? 0 : -1;
 }
 
+int scene_indexed;       /* 1: the first test's path (GL transforms and clips indexed meshes), as a control */
+
+static void draw_indexed(const TRMesh *m, int frame, unsigned base, unsigned light, const float model[16]) {
+    const TRFrame *f = &m->frames[frame];
+    const uint8_t *v = m->vertices + (size_t)f->vertex_start * (size_t)m->vertex_size;
+    glVertexPointer(3, GL_FLOAT, m->vertex_size, v + m->pos_offset);
+    glActiveTexture(GL_TEXTURE1);
+    glClientActiveTexture(GL_TEXTURE1);
+    if (light && m->uv_count > 1) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, light);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glTexCoordPointer(2, GL_FLOAT, m->vertex_size, v + m->uv_offset[1]);
+    } else {
+        glDisable(GL_TEXTURE_2D);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glClientActiveTexture(GL_TEXTURE0);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, base);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, m->vertex_size, v + m->uv_offset[0]);
+    glPushMatrix();
+    glMultMatrixf(model);
+    glDrawElements(GL_TRIANGLES, f->index_count, GL_UNSIGNED_SHORT, m->indices + f->index_start);
+    glPopMatrix();
+    scene_stat_draws++;
+    scene_stat_vertices += f->vertex_count;
+    scene_stat_triangles += f->index_count / 3;
+}
+
 static void draw(const TRMesh *m, int frame, unsigned base, unsigned light, float x, float y, float z, float scale) {
     float model[16] = { scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 0, x, y, z, 1 };
-    r3d_mesh(m, frame, model, base, light, 1);
+    if (scene_indexed) draw_indexed(m, frame, base, light, model);
+    else r3d_mesh(m, frame, model, base, light, 1);
 }
 
 void scene_frame(int w, int h, float dt, int mode) {
@@ -83,7 +117,21 @@ void scene_frame(int w, int h, float dt, int mode) {
     float up[3] = { 0, -fwd[2], fwd[1] };
     float view[16] = { 1, up[0], 0, 0, 0, up[1], -fwd[1], 0, 0, up[2], -fwd[2], 0,
                        -eye[0], -(up[1] * eye[1] + up[2] * eye[2]), fwd[1] * eye[1] + fwd[2] * eye[2], 1 };
-    r3d_begin(w, h, projection, view);
+    if (scene_indexed) {
+        scene_stat_draws = scene_stat_vertices = scene_stat_triangles = 0;
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_FRONT);               /* the models' front faces are clockwise */
+        glColor4f(1.f, 1.f, 1.f, 1.f);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_NORMAL_ARRAY);
+        glMatrixMode(GL_PROJECTION);
+        glLoadMatrixf(projection);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadMatrixf(view);
+    } else {
+        r3d_begin(w, h, projection, view);
+    }
 
     int first = (int)(sDistance / 60.f) - 1;
     for (int i = first; i < first + 8; i++) {
@@ -99,9 +147,23 @@ void scene_frame(int w, int h, float dt, int mode) {
             draw(sEnemy, ((int)sAnim + i * 5) % sEnemy->frame_count, sEnemyTex, 0, -8.f + 8.f * (float)i, 0,
                  runner_z + 20.f + 4.f * (float)(i & 1), 1.f);
     }
-    r3d_end();
-    scene_stat_draws = r3d_stat_draws;
-    scene_stat_vertices = r3d_stat_vertices_in;
-    scene_stat_triangles = r3d_stat_triangles_out;
+    if (scene_indexed) {
+        glActiveTexture(GL_TEXTURE1);
+        glClientActiveTexture(GL_TEXTURE1);
+        glDisable(GL_TEXTURE_2D);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glActiveTexture(GL_TEXTURE0);
+        glClientActiveTexture(GL_TEXTURE0);
+        glDisable(GL_CULL_FACE);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+    } else {
+        r3d_end();
+        scene_stat_draws = r3d_stat_draws;
+        scene_stat_vertices = r3d_stat_vertices_in;
+        scene_stat_triangles = r3d_stat_triangles_out;
+    }
     glDisable(GL_DEPTH_TEST);
 }

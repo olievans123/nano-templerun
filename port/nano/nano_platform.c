@@ -103,7 +103,7 @@ void port_crumb(const char *tag,uint32_t a,uint32_t b) {
     __asm__ volatile("dsb":::"memory");
 }
 /* Previous run's ring: scan the heap region for the magic (16-byte aligned blocks). */
-static void save_previous_crumbs(void) {
+static void save_previous_crumbs(const char *file) {
     for(uint32_t a=0x08800000u;a<0x0B800000u;a+=16u) {
         crumb_ring_t *r=(crumb_ring_t *)(uintptr_t)a;
         if(r->magic0==CRUMB_MAGIC0&&r->magic1==CRUMB_MAGIC1&&r!=s_ring&&r->len<=sizeof(r->text)) {
@@ -111,7 +111,8 @@ static void save_previous_crumbs(void) {
             if(buf) {
                 memcpy(buf,r->text,r->len);
                 hb_fs_mkdir("/Apps/Data");hb_fs_mkdir(DATA_DIR);
-                hb_fs_write(DATA_DIR "/prevboot.txt",buf,r->len);free(buf);
+                char path[112];snprintf(path,sizeof path,DATA_DIR "/%s",file);
+                hb_fs_write(path,buf,r->len);free(buf);
             }
             r->magic0=0;   /* consumed */
             return;
@@ -130,6 +131,20 @@ static void keep_awake(void) {          /* as the other nano game ports (firmwar
     if(manager)((event_fn)(0x084069d8u|1u))(manager,4);
 }
 
+/* Each launch tries the next way of handing the scene to GL, so a run of launches shows
+ * which ones the nano's driver accepts. The trial number is stored before anything is
+ * drawn; a trial that lives six seconds leaves its numbers in trial-N.txt, and the crash
+ * trail of the launch before is saved as prev-N.txt. */
+#define TRIALS 5
+static const struct { const char *name;int indexed,mode; } trials[TRIALS]={
+    {"world positions, GL matrices, buffer object",0,R3D_WORLD|R3D_VBO},
+    {"world positions, GL matrices, client arrays",0,R3D_WORLD},
+    {"clip positions, client arrays, small draws, colour array",0,R3D_SMALL|R3D_COLOR},
+    {"clip positions, buffer object",0,R3D_VBO},
+    {"indexed meshes straight through GL (first test)",1,0},
+};
+static int trial;
+
 /* Each mode runs for PHASE_US; a line is logged as each one ends (three writes in all),
  * then the full scene carries on. */
 #define PHASE_US 3000000u
@@ -147,8 +162,17 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
         uint64_t t0=plat_time_us();
         plat_log("Temple Run hardware test: panel %dx%d, heap free %u, largest %u, redraw %s",w,h,hb_os_heap_free(),
                  hb_os_heap_largest(),tr_fast_redraw?"2 ms heartbeat":"16 ms heartbeat");
-        save_previous_crumbs();
-        port_crumb("init",(uint32_t)hb_os_heap_free(),0);
+        {
+            uint32_t size=0;unsigned char *d=plat_read_file("trial.bin",&size,1);
+            trial=d&&size>=1?d[0]%TRIALS:0;free(d);
+            unsigned char next=(unsigned char)((trial+1)%TRIALS);
+            char prev[16];snprintf(prev,sizeof prev,"prev-%d.txt",(trial+TRIALS-1)%TRIALS);
+            save_previous_crumbs(prev);
+            plat_write_file("trial.bin",&next,1);
+            scene_indexed=trials[trial].indexed;r3d_set_mode(trials[trial].mode);
+            plat_log("trial %d: %s",trial,trials[trial].name);
+        }
+        port_crumb("trial",(uint32_t)trial,0);
         if(manifest() || scene_init()) {
             plat_log("initialization failed");port_log_flush(DATA_DIR "/log.txt");failed=1;return;
         }
@@ -180,6 +204,19 @@ void tr_nano_frame(int w,int h,uint32_t frame) {
             port_crumb("flush",(uint32_t)i,0);
             port_log_flush(DATA_DIR "/log.txt");
             port_crumb("flushed",(uint32_t)i,0);
+            last=0;
+        }
+        if(index>=PHASES && !reported) {
+            char text[200],name[16];
+            uint32_t f0=phase[0].period?(uint32_t)((uint64_t)phase[0].frames*10000000u/phase[0].period):0;
+            uint32_t f1=phase[1].period?(uint32_t)((uint64_t)phase[1].frames*10000000u/phase[1].period):0;
+            int n=snprintf(text,sizeof text,"trial %d (%s) ran 6 s: with lightmap %u.%u fps, work %u us; without %u.%u fps, work %u us\n",
+                           trial,trials[trial].name,(unsigned)(f0/10),(unsigned)(f0%10),
+                           (unsigned)(phase[0].work/(phase[0].frames?phase[0].frames:1)),(unsigned)(f1/10),(unsigned)(f1%10),
+                           (unsigned)(phase[1].work/(phase[1].frames?phase[1].frames:1)));
+            snprintf(name,sizeof name,"trial-%d.txt",trial);
+            port_crumb("result",(uint32_t)trial,0);
+            if(n>0)plat_write_file(name,text,(uint32_t)n);
             last=0;
         }
         if(index>=PHASES){reported=1;index=0;}
